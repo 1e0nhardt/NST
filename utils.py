@@ -14,6 +14,31 @@ import torch.nn.functional as F
 CONSOLE = Console(width=120)
 
 
+def check_folder(path: str):
+    if not os.path.exists(path):
+        CONSOLE.print(f'* {path} does not exist, creating...')
+        os.makedirs(path, exist_ok=True)
+
+
+def get_basename(path: str):
+    base_name = os.path.basename(path)
+    return os.path.splitext(base_name)[0]
+
+
+###############################################################################
+###############################image utils#####################################
+###############################################################################
+
+def erase(img: torch.Tensor, i: int, j: int, h: int, w: int, v=None, inplace: bool = False) -> torch.Tensor:
+    if not inplace:
+        img = img.clone()
+
+    if v is None:
+        v = torch.rand([h, w])
+    
+    img[..., i : i + h, j : j + w] = v
+    return img
+
 class PadHelper(object):
     def pad_to8x(self, t:torch.Tensor, mode:str = 'reflect'):
         assert len(t.shape) == 4, "tensor shape must be [b, c, h, w]"
@@ -76,7 +101,10 @@ def save_image(rgb_tensor: torch.Tensor, path: str):
     DIR, _ = os.path.split(path)
     if not os.path.exists(DIR) and DIR != '':
         os.makedirs(DIR, exist_ok=True)
-    rgb_numpy = tensor2img(rgb_tensor)
+    if rgb_tensor.dtype == torch.uint8:
+        rgb_numpy = rgb_tensor.permute(1, 2, 0).numpy().astype(np.uint8)
+    else:
+        rgb_numpy = tensor2img(rgb_tensor)
     Image.fromarray(rgb_numpy).save(path)
 
 
@@ -93,7 +121,7 @@ def print_gpu_mem():
     print(f'\033[92mAt {where_str:<50}\033[0m \n\033[92mAllocated: {torch.cuda.memory_allocated() / 1024**2} MB, Reserved: {torch.cuda.memory_reserved() / 1024**2} MB\033[0m \n')
 
 
-def print_module_params(m:torch.nn.Module, only_shape:bool = False):
+def print_module_params(m:torch.nn.Module, only_shape:bool = True):
     for name, param in m.named_parameters():
         if only_shape:
             CONSOLE.print(f"{name}: {param.shape}")
@@ -152,6 +180,9 @@ class TimeRecorder(object):
     def __init__(self, title="Time Record") -> None:
         self._title = title
         self._record = {}
+        self._start = time.time()
+    
+    def reset_time(self):
         self._start = time.time()
     
     def set_record_point(self, key: str):
