@@ -6,18 +6,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+import tyro
 from einops import rearrange, repeat
 from PIL import Image
 from torch import optim
-from torch.autograd import Variable
 from torchvision import models, transforms
 from torchvision.utils import save_image
 
-
 from losses import gram_loss, tv_loss
 from models.vgg import VGG19FeatureExtractor
-from utils import check_folder, get_basename, CONSOLE, erase
-import tyro
+from utils import CONSOLE, check_folder, get_basename, str2list
+
 
 @dataclass
 class GatysConfig:
@@ -25,13 +24,15 @@ class GatysConfig:
 
     output_dir: str = "./results/gatys"
     """output dir"""
+    layers: str = "1,6,11,20,29"
+    """layer indices of style features which should seperate by ','"""
     lambda_s: float = 100
     """style weight"""
     max_iter: int = 800
     """LBFGS optimize steps"""
     show_iter: int = 50
     """frequencies to show current loss"""
-    standardize: bool = False
+    standardize: bool = True
     """use ImageNet mean to standardization"""
     input_range: int = 1
     """scale number range after normalization and standardization"""
@@ -48,9 +49,10 @@ class GatysPipeline(object):
         self.config = config
         CONSOLE.print(config)
         check_folder(self.config.output_dir)
+        style_layers = str2list(self.config.layers)
 
         # prepare model
-        self.vgg = VGG19FeatureExtractor(self.config.use_in)
+        self.vgg = VGG19FeatureExtractor(style_layers, self.config.use_in)
         self.vgg.freeze_params()
         if torch.cuda.is_available():
             self.vgg.cuda()
@@ -84,11 +86,6 @@ class GatysPipeline(object):
         # optimize target
         opt_img = content_image.data.clone()
         # opt_img = self.transform_pre(Image.open("./results/gatys/Tuebingen_Neckarfront_6_100_1_raw_raw_tv.png")).unsqueeze(0)
-
-        # opt_img = erase(opt_img, 100, 100, 200, 200, content_image[..., 100:300, 100:300])
-        # opt_img = transforms.RandomErasing(p=1)(opt_img)
-        # opt_img = transforms.RandomErasing(p=1)(opt_img)
-        # erase_mask = torch.rand_like(opt_img[0, 0]) > 0.4
 
         # erase_mask = torch.zeros_like(opt_img[0, 0])
         # erase_mask[100:300, 100:300] = 1

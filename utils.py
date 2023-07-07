@@ -1,4 +1,5 @@
 from PIL import Image
+import imageio
 import numpy as np
 import time
 import torch
@@ -16,7 +17,7 @@ CONSOLE = Console(width=120)
 
 def check_folder(path: str):
     if not os.path.exists(path):
-        CONSOLE.print(f'* {path} does not exist, creating...')
+        CONSOLE.print(f'Directory {path} does not exist, creating...')
         os.makedirs(path, exist_ok=True)
 
 
@@ -25,19 +26,19 @@ def get_basename(path: str):
     return os.path.splitext(base_name)[0]
 
 
+def str2list(s: str):
+    return [int(x.strip()) for x in s.split(',')]
+
+
 ###############################################################################
 ###############################image utils#####################################
 ###############################################################################
 
-def erase(img: torch.Tensor, i: int, j: int, h: int, w: int, v=None, inplace: bool = False) -> torch.Tensor:
-    if not inplace:
-        img = img.clone()
 
-    if v is None:
-        v = torch.rand([h, w])
-    
-    img[..., i : i + h, j : j + w] = v
-    return img
+def images2gif(images: list, path, duration_ms=500):
+    """将PIL图像列表保存为gif"""
+    images[0].save(path, save_all=True, append_images=images[1:], optimize=True, duration=duration_ms, loop=0)
+
 
 class PadHelper(object):
     def pad_to8x(self, t:torch.Tensor, mode:str = 'reflect'):
