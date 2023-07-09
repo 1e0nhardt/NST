@@ -6,34 +6,38 @@ from einops import rearrange, repeat
 from PIL import Image
 from torch import optim
 
-from losses import gram_loss, tv_loss
-from utils import CONSOLE, AorB, check_folder
+from utils import CONSOLE, check_folder, AorB
+from utils_st import exact_feature_distribution_matching
 from pipeline_optimize import OptimzeBaseConfig, OptimzeBasePipeline
 
 
-
 @dataclass
-class GatysConfig(OptimzeBaseConfig):
-    """Gatys NST Arguments  
+class EFDMConfig(OptimzeBaseConfig):
+    """EFDM NST Arguments  
     IN 改变了特征响应的均值和方差  
     input_range 也改变了响应的均值和方差  
     standrardize 只改变了均值
     """
 
-    output_dir: str = "./results/gatys"
+    output_dir: str = "./results/efdm"
     """output dir"""
-    lambda_s: float = 1000
+    lambda_s: float = 100
     """style weight"""
     use_tv_loss: bool = False
     """use total variance loss"""
 
 
-class GatysPipeline(OptimzeBasePipeline):
-    def __init__(self, config: GatysConfig) -> None:
+class EFDMPipeline(OptimzeBasePipeline):
+    def __init__(self, config: EFDMConfig) -> None:
         super().__init__(config)
         CONSOLE.print(config)
         self.config = config
         check_folder(self.config.output_dir)
+    
+    def add_extra_infos(self):
+        infos = []
+        infos += [str(self.config.lambda_s)]
+        return infos
     
     def optimize_process(self, content_path, style_path, mask=False):
         # prepare input tensors: (1, c, h, w), (1, c, h, w)
@@ -68,23 +72,38 @@ class GatysPipeline(OptimzeBasePipeline):
         # get target features
         _, style_features = self.vgg.forward(style_image)
         content_features, fs = self.vgg.forward(content_image)
-        if self.config.verbose: # 查看各层特征图的实际内容
+        target_features = [exact_feature_distribution_matching(fs[i], style_features[i]) for i in range(len(style_features)-1)] # 4-1
+
+        # 查看各层特征图的实际内容
+        if self.config.verbose: 
             self.vis_feature_activations()
 
         # optimize
         optimizer = optim.LBFGS([opt_img])
-        # style_weights = [n/256 for n in [64,128,256,512,512]]
-        style_weights = [128/n for n in [64,128,256,512,512]]
         n_iter = [0]
 
         while n_iter[0] <= self.config.max_iter:
             def closure():
                 optimizer.zero_grad()
-                c_feats, s_feats = self.vgg(opt_img)
-                style_loss = gram_loss(s_feats, style_features, style_weights)
-                content_loss = torch.mean((c_feats - content_features) ** 2)
+
+                _, s_feats = self.vgg(opt_img)
+
+                style_loss = 0
+                for i in range(len(s_feats) - 1):
+                    input = s_feats[i]
+                    target = target_features[i]
+                    B, C, W, H = input.size(0), input.size(1), input.size(2), input.size(3)
+                    _, index_content = torch.sort(input.view(B, C, -1))
+                    value_style, _ = torch.sort(target.view(B, C, -1))
+                    inverse_index = index_content.argsort(-1)
+                    style_loss += torch.mean((input.view(B,C,-1)-value_style.gather(-1, inverse_index))**2)
+
+                content_loss = torch.mean((s_feats[-2] - target_features[-1]) ** 2)
+
                 # total_variance_loss = tv_loss(opt_img)
+
                 loss = self.config.lambda_s * style_loss + content_loss #+ 1 * total_variance_loss
+
                 loss.backward()
                 # 将不需要优化的区域的梯度置为零
                 if mask:
@@ -106,12 +125,12 @@ class GatysPipeline(OptimzeBasePipeline):
         
         return optimze_images
 
-    
+
 if __name__ == '__main__':
-    args = tyro.cli(GatysConfig)
-    pipeline = GatysPipeline(args)
+    args = tyro.cli(EFDMConfig)
+    pipeline = EFDMPipeline(args)
     pipeline(
         'data/content/sailboat.jpg', 
-        'data/style/19.jpg',
+        'data/style/vangogh_starry_night.jpg',
         mask=False
     )

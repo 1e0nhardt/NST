@@ -26,6 +26,15 @@ def get_basename(path: str):
     return os.path.splitext(base_name)[0]
 
 
+def AorB(cond: bool, a, b=None):
+    if cond:
+        return [str(a)]
+    elif b is None:
+        return []
+    else:
+        return [str(b)]
+
+
 def str2list(s: str):
     return [int(x.strip()) for x in s.split(',')]
 

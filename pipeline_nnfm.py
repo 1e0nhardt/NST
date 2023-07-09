@@ -19,76 +19,41 @@ from losses import gram_loss, tv_loss, feat_replace, cos_loss
 from models.vgg import VGG16FeatureExtractor, VGG19FeatureExtractor
 from utils import check_folder, get_basename, str2list, images2gif, CONSOLE
 import tyro
+from pipeline_optimize import OptimzeBaseConfig, OptimzeBasePipeline
 
 
 @dataclass
-class NNFMConfig:
+class NNFMConfig(OptimzeBaseConfig):
     """NNFM Arguments"""
 
     output_dir: str = "./results/nnfm"
     """output dir"""
     layers: str = "11,13,15"
     """layer indices of style features which should seperate by ','"""
-    resize: int = 512
-    """image resize"""
-    standardize: bool = True
-    """use ImageNet mean to standardization"""
-    max_iter: int = 500
-    """optimize steps"""
-    show_iter: int = 50
-    """frequencies to show current loss"""
-    use_in: bool = False
-    """apply instance normalization on all style feature maps"""
-    verbose: bool = False
-    """show additional information"""
 
 
-class NNFMPipeline(object):
+class NNFMPipeline(OptimzeBasePipeline):
     def __init__(self, config: NNFMConfig) -> None:
+        super().__init__(config)
         self.config = config
         CONSOLE.print(config)
         check_folder(self.config.output_dir)
-        style_layers = str2list(self.config.layers)
 
-        # prepare model
-        self.vgg = VGG16FeatureExtractor(style_layers, self.config.use_in)
-        self.vgg.freeze_params()
-        if torch.cuda.is_available():
-            self.vgg.cuda()
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-        # prepare transforms
-        transform_pre_list = []
-        transform_post_list = []
-        transform_pre_list.append(transforms.Resize(self.config.resize))
-        transform_pre_list.append(transforms.ToTensor()) # PIL to Tensor
-        if self.config.standardize:
-            transform_pre_list.append(transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[1,1,1]))
-            transform_post_list.append(transforms.Normalize(mean=[-0.485, -0.456, -0.406], std=[1, 1, 1]))
-        transform_post_list.reverse()
-        transform_post_list.append(transforms.Lambda(lambda x: torch.clamp(x, min=0, max=1)))
-        transform_post_list.append(transforms.ToPILImage()) # Tensor to PIL
-
-        self.transform_pre = transforms.Compose(transform_pre_list)
-        self.transform_post = transforms.Compose(transform_post_list)
-
-    def __call__(self, content_path: str, style_path: str, mask=False) -> Any:
-        expr_name = f'{get_basename(content_path)}_{get_basename(style_path)}_16_{"std" if self.config.standardize else "raw"}_{"in" if self.config.use_in else "raw"}_tv{"_mask" if mask else ""}_RandomMask'
-        expr_dir = self.config.output_dir + '/' + expr_name
-        check_folder(expr_dir)
-
+    # def add_extra_infos(self):
+    #     return ['100x']
+    
+    def optimize_process(self, content_path, style_path, mask=False):
         # prepare input tensors: (1, c, h, w), (1, c, h, w)
         content_image = self.transform_pre(Image.open(content_path)).unsqueeze(0).to(self.device)
-        style_image = self.transform_pre(Image.open(style_path)).unsqueeze(0).to(self.device)
-        if style_image.shape[1] == 1: # grayscale image
-            style_image = repeat(style_image, 'b c h w -> b (repeat c) h w', repeat=3)
-        
+        # convert("RGB")会让灰度图像也变为3通道
+        style_image = self.transform_pre(Image.open(style_path).convert("RGB")).unsqueeze(0).to(self.device)
+
         # optimize target
         optimze_images = []
         opt_img = content_image.data.clone()
         opt_img = opt_img.to(self.device)
         if mask:
-            opt_img = self.transform_pre(Image.open(expr_dir[:-16]+"/optimize_result.png")).unsqueeze(0).to(self.device)
+            opt_img = self.transform_pre(Image.open(self.generate_expr_name(content_path, style_path)+"/optimize_result.png")).unsqueeze(0).to(self.device)
 
             # generate mask
             # erase_mask = torch.zeros_like(opt_img[0, 0])
@@ -99,9 +64,9 @@ class NNFMPipeline(object):
             self.erase_mask = torch.rand_like(opt_img) > 0.4
 
             opt_img[self.erase_mask] = content_image[self.erase_mask]
+            
         # save init image
         out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-        out_img.save(expr_dir + f'/init_image.png')
         optimze_images.append(out_img)
 
         opt_img.requires_grad = True
@@ -142,15 +107,15 @@ class NNFMPipeline(object):
         # save results
         out_img = self.transform_post(opt_img.detach().cpu().squeeze())
         optimze_images.append(out_img)
-        images2gif(optimze_images, expr_dir + '/optimize_process.gif')
-        out_img.save(expr_dir + '/optimize_result.png')
+
+        return optimze_images
 
 
 if __name__ == '__main__':
     args = tyro.cli(NNFMConfig)
     pipeline = NNFMPipeline(args)
     pipeline(
-        'data/Tuebingen_Neckarfront.jpg', 
-        'data/style/6.jpg',
+        'data/content/sailboat.jpg', 
+        'data/style/vangogh_starry_night.jpg',
         mask=False
     )
