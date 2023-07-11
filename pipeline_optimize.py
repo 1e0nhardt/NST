@@ -38,6 +38,8 @@ class OptimzeBaseConfig:
     """apply instance normalization on all style feature maps"""
     resize: int = 512
     """image resize"""
+    save_process: bool = False
+    """save images of optimize process as gif"""
     verbose: bool = False
     """show additional information"""
 
@@ -79,8 +81,8 @@ class OptimzeBasePipeline(object):
 
         return transforms.Compose(transform_pre_list), transforms.Compose(transform_post_list)
     
-    def generate_expr_name(self, content_path, style_path, mask=False):
-        infos = [get_basename(content_path), get_basename(style_path)]
+    def generate_expr_name(self, mask=False):
+        infos = []
         infos += AorB(self.config.use_vgg19, 'vgg19', 'vgg16')
         infos += AorB(self.config.standardize, 'std', 'raw')
         infos += [str(self.config.input_range)]
@@ -92,6 +94,9 @@ class OptimzeBasePipeline(object):
     
     def add_extra_infos(self):
         return []
+    
+    def generate_filename(self, content_path: str, style_path:str):
+        return get_basename(content_path) + '_' + get_basename(style_path)
     
     def vis_feature_activations(self, fs):
         for i, feats in enumerate(fs):
@@ -110,12 +115,15 @@ class OptimzeBasePipeline(object):
         assert False, "you should implement this method in extended class"
 
     def __call__(self, content_path: str, style_path: str, mask=False):
-        expr_name = self.generate_expr_name(content_path, style_path, mask=mask)
+        expr_name = self.generate_expr_name(mask=mask)
         expr_dir = self.config.output_dir + '/' + expr_name
         check_folder(expr_dir)
 
+
         optimize_images = self.optimize_process(content_path, style_path, mask)
         
-        images2gif(optimize_images, expr_dir + '/optimize_process.gif')
-        optimize_images[0].save(expr_dir + '/init_image.png')
-        optimize_images[-1].save(expr_dir + '/optimize_result.png')
+        filename = self.generate_filename(content_path, style_path)
+        if self.config.save_process:
+            images2gif(optimize_images, expr_dir + f'/{filename}_process.gif')
+            optimize_images[0].save(expr_dir + f'/{filename}_init.png')
+        optimize_images[-1].save(expr_dir + f'/{filename}_result.png')

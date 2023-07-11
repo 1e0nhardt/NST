@@ -51,7 +51,9 @@ class EFDMPipeline(OptimzeBasePipeline):
         opt_img = opt_img.to(self.device)
 
         if mask:
-            opt_img = self.transform_pre(Image.open(self.generate_expr_name(content_path, style_path)+"/optimize_result.png")).unsqueeze(0).to(self.device)
+            opt_img = self.transform_pre(Image.open(
+                self.generate_expr_name()+f"/{self.generate_filename(content_path, style_path)}_result.png"
+            )).unsqueeze(0).to(self.device)
 
             # generate mask
             erase_mask = torch.zeros_like(opt_img[0, 0])
@@ -129,8 +131,16 @@ class EFDMPipeline(OptimzeBasePipeline):
 if __name__ == '__main__':
     args = tyro.cli(EFDMConfig)
     pipeline = EFDMPipeline(args)
-    pipeline(
-        'data/content/sailboat.jpg', 
-        'data/style/vangogh_starry_night.jpg',
-        mask=False
-    )
+    import os
+    for c in os.listdir('data/content'):
+            for s in [0, 6, 8, 122, 130, 143]:
+                pipeline(
+                    f'data/content/{c}',
+                    f'data/style/{s}.jpg',
+                    mask=False
+                )
+    # pipeline(
+    #     'data/content/sailboat.jpg', 
+    #     'data/style/6.jpg',
+    #     mask=False
+    # )

@@ -5,6 +5,8 @@ import torchvision
 from PIL import Image
 from torchvision import models, transforms
 
+from utils_st import calc_mean_std
+
 
 class VGG19FeatureExtractor(nn.Module):
     """
@@ -28,6 +30,9 @@ class VGG19FeatureExtractor(nn.Module):
 
         for i, layer in enumerate(self.model):
             x = layer(x)
+            # if self.use_in:
+            #     x_mean, x_std = calc_mean_std(x)
+            #     x = (x - x_mean) / x_std
             if i in self.layers:
                 if self.use_in:
                     x = F.instance_norm(x)

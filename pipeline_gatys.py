@@ -47,7 +47,9 @@ class GatysPipeline(OptimzeBasePipeline):
         opt_img = opt_img.to(self.device)
 
         if mask:
-            opt_img = self.transform_pre(Image.open(self.generate_expr_name(content_path, style_path)+"/optimize_result.png")).unsqueeze(0).to(self.device)
+            opt_img = self.transform_pre(Image.open(
+                self.generate_expr_name()+f"/{self.generate_filename(content_path, style_path)}_result.png"
+            )).unsqueeze(0).to(self.device)
 
             # generate mask
             erase_mask = torch.zeros_like(opt_img[0, 0])
