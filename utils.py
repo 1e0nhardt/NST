@@ -1,3 +1,4 @@
+from typing import Sequence
 from PIL import Image
 import imageio
 import numpy as np
@@ -11,13 +12,39 @@ import matplotlib as mpl
 import inspect
 import os
 import torch.nn.functional as F
+from torchvision.transforms.functional import InterpolationMode, _interpolation_modes_from_int, resize, get_dimensions
+import logging
+from rich.logging import RichHandler
 
-CONSOLE = Console(width=120)
+
+CONSOLE = Console()
+
+
+class MyFilter(logging.Filter):
+    def __init__(self, name: str = "") -> None:
+        super().__init__(name)
+        self.pys = []  # 记录项目所有的py文件
+        for _, _, i in os.walk(os.path.dirname(__file__)):
+            self.pys.extend([j for j in i if j.endswith('py')])
+        # CONSOLE.print(self.pys)
+
+    def filter(self, record):
+        if record.filename in self.pys:
+            return True
+        return False
+
+FORMAT = "%(message)s"
+rich_handler = RichHandler(markup=True)
+rich_handler.addFilter(MyFilter())
+logging.basicConfig(
+    level=logging.DEBUG, format=FORMAT, datefmt="[%X]", handlers=[rich_handler])
+
+LOGGER = logging.getLogger("rich")
 
 
 def check_folder(path: str):
     if not os.path.exists(path):
-        CONSOLE.print(f'Directory {path} does not exist, creating...')
+        LOGGER.info(f'[red]Directory {path} does not exist, creating...[/]')
         os.makedirs(path, exist_ok=True)
 
 
@@ -43,14 +70,59 @@ def str2list(s: str):
 ###############################image utils#####################################
 ###############################################################################
 
+class ResizeMaxSide(torch.nn.Module):
+    def __init__(self, size, interpolation=InterpolationMode.BILINEAR,antialias="True"):
+        super().__init__()
+        
+        if not isinstance(size, (int, Sequence)):
+            raise TypeError(f"Size should be int or sequence. Got {type(size)}")
+        if isinstance(size, Sequence) and len(size) not in (1, 2):
+            raise ValueError("If size is a sequence, it should have 1 or 2 values")
+        self.size = size
+
+        if isinstance(interpolation, int):
+            interpolation = _interpolation_modes_from_int(interpolation)
+
+        self.interpolation = interpolation
+        self.antialias = antialias
+
+    def forward(self, img):
+        """
+        Args:
+            img (PIL Image or Tensor): Image to be scaled.
+
+        Returns:
+            PIL Image or Tensor: Rescaled image.
+        """
+        if type(self.size) == int or len(self.size) == 1:  # specified size only for the smallest edge
+            _, h, w = get_dimensions(img)
+            scale_factor = self.size / max(h, w)
+            new_h = int(h * scale_factor)
+            new_w = int(w * scale_factor)
+        else:  # specified both h and w
+            new_h, new_w = self.size
+        return resize(img, [new_h, new_w], self.interpolation, None, self.antialias)
+
 
 def images2gif(images: list, path, duration_ms=500):
     """将PIL图像列表保存为gif"""
     images[0].save(path, save_all=True, append_images=images[1:], optimize=True, duration=duration_ms, loop=0)
 
 
-class PadHelper(object):
-    def pad_to8x(self, t:torch.Tensor, mode:str = 'reflect'):
+class ResizeHelper(object):
+    def resize_to8x(self, t: torch.Tensor, mode: str = 'bilinear'):
+        assert len(t.shape) == 4, "tensor shape must be [b, c, h, w]"
+        h, w = t.shape[2:]
+        h_new = (h + 7) // 8 * 8
+        w_new = (w + 7) // 8 * 8
+        self.old_size = (h, w)
+        self.mode = mode
+        F.interpolate(t, (h_new, w_new), mode=mode)
+    
+    def resize_to_original(self, t: torch.Tensor):
+        assert self.old_size is not None, "this method should only use after resize_to8x()"
+
+    def pad_to8x(self, t: torch.Tensor, mode: str = 'reflect'):
         assert len(t.shape) == 4, "tensor shape must be [b, c, h, w]"
         h, w = t.shape[2:]
         h_new = (h + 7) // 8 * 8
@@ -64,7 +136,7 @@ class PadHelper(object):
         self.t_data = (h_new, w_new, t_pad, b_pad, l_pad, r_pad)
         return F.pad(t, [l_pad, r_pad, t_pad, b_pad], mode=mode)
 
-    def crop_to_original(self, t:torch.Tensor):
+    def crop_to_original(self, t: torch.Tensor):
         assert self.t_data is not None, "this method should only use after pad_to8x()"
         h_new, w_new, t_pad, b_pad, l_pad, r_pad = self.t_data
         return t[:, :, t_pad:h_new-b_pad, l_pad:w_new-r_pad]
@@ -94,7 +166,25 @@ def showimgs(rows, cols, imgs, titles=None, cmap='viridis'):
     for ax, img, title in zip(axes, imgs, titles):
         showimg(ax, img, title, cmap)
     plt.show()
-    
+
+
+def image_grid(images):
+  """Return a 1x5 grid of the images as a matplotlib figure."""
+  # Create a figure to contain the plot.
+  figure = plt.figure(figsize=(10,3))
+  titles = ["HM_init", "HM_3", "HM_2", "HM_1", "HM_0"]
+  for i in range(5):
+    LOGGER.warning(images[i].max())
+    LOGGER.warning(images[i].min())
+    # Start next subplot.
+    plt.subplot(1, 5, i + 1, title=titles[i])
+    plt.xticks([])
+    plt.yticks([])
+    plt.grid(False)
+    plt.imshow(images[i].squeeze().permute(1, 2, 0))
+
+  return figure
+
 
 def tensor2img(rgb_tensor: torch.Tensor, opencv=False):
     """
@@ -116,6 +206,22 @@ def save_image(rgb_tensor: torch.Tensor, path: str):
     else:
         rgb_numpy = tensor2img(rgb_tensor)
     Image.fromarray(rgb_numpy).save(path)
+
+###############################################################################
+###############################other utils#####################################
+###############################################################################
+
+def print_node(n, title=None):
+    title = "TensorNode" if not title else title
+    table = Table(title=title)
+    table.add_column('attr')
+    table.add_column('value')
+    table.add_row("data", str(n.data))
+    table.add_row("grad", str(n.grad))
+    table.add_row("grad_fn", str(n.grad_fn))
+    table.add_row("is_leaf", str(n.is_leaf))
+    table.add_row("requires_grad", str(n.requires_grad))
+    CONSOLE.print(table)
 
 
 def calc_mem_allocated(t: torch.Tensor):
@@ -202,6 +308,12 @@ class TimeRecorder(object):
         self._record[key] = now - self._start
         self._start = now
     
+    def get_record_point(self, key: str):
+        if key not in self._record.keys():
+            CONSOLE.print(f'The key is not recorded ==> {key}')
+            return -1
+        return self._record[key]
+    
     def show(self):
         table = Table(title=self._title)
         table.add_column('Key', style='cyan')
@@ -237,8 +349,6 @@ class Recorder(object):
     
     def __del__(self):
         self._file.close()
-
-recorder = Recorder()
 
 
 if __name__ == '__main__':

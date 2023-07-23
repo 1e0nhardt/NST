@@ -6,14 +6,10 @@ from torch.autograd import Function
 
 class RemdLoss(Function):
     """
-    M = A @ B
-
-    remd = max(mean(M.min(1)), mean(M.min(2)))
-
-    输入必须标准化过，且形状如下
-
-    A: (1, hw, c)
-
+    M = A @ B \n
+    remd = max(mean(M.min(1)), mean(M.min(2))) \n
+    输入必须标准化过，且形状如下 \n
+    A: (1, hw, c) \n
     B: (1, c, hw)
     """
 
@@ -89,16 +85,11 @@ class RemdLoss(Function):
 
 class SelfSimilarityLoss(Function):
     """
-    MA = 1 - AT @ A, MB = 1 - BT @ B
-
-    ss = mean(abs(MA - MB))
-
-    输入必须标准化过，且形状如下
-
-    AT, BT: (1, hw, c)
-
-    A, BT: (1, c, hw)
-
+    MA = 1 - AT @ A, MB = 1 - BT @ B \n
+    ss = mean(abs(MA - MB)) \n
+    输入必须标准化过，且形状如下 \n
+    AT, BT: (1, hw, c) \n
+    A, BT: (1, c, hw) \n
     关于forward添加非tensor参数的问题 https://github.com/pytorch/pytorch/issues/16940
     """
 
@@ -194,12 +185,9 @@ def mean_variance_norm(feat):
 
 def calc_remd_loss_custom(A, B, step=64):
     """
-    使用自定义算子计算REMD损失，需要的显存从O(hw^2)降为O(hw)，但因为计算从并行变为串行，计算速度会变慢。
-    
-    A, B: (1, c, h, w)
-
-    M = A @ B
-
+    使用自定义算子计算REMD损失，需要的显存从O(hw^2)降为O(hw)，但因为计算从并行变为串行，计算速度会变慢。 \n
+    A, B: (1, c, h, w) \n
+    M = A @ B \n
     remd = max(mean(M.min(1)), mean(M.min(2)))
     """
     b, c, h, w = A.shape
@@ -222,14 +210,10 @@ def calc_remd_loss_custom(A, B, step=64):
 
 def calc_ss_loss_custom(A, B, step=64):
     """
-    使用自定义算子计算自相似损失，需要的显存从O(hw^2)降为O(hw)，但因为计算从并行变为串行，计算速度会变慢。
-
-    A, B: (1, c, h, w)
-
-    MA = 1 - AT @ A, MB = 1 - BT @ B
-
-    ss = mean(abs(MA - MB))
-
+    使用自定义算子计算自相似损失，需要的显存从O(hw^2)降为O(hw)，但因为计算从并行变为串行，计算速度会变慢。 \n
+    A, B: (1, c, h, w) \n
+    MA = 1 - AT @ A, MB = 1 - BT @ B \n
+    ss = mean(abs(MA - MB)) \n
     A,B的形状必须完全相同。
     """
     b, c, h, w = A.shape

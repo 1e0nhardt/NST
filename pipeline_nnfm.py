@@ -17,7 +17,7 @@ from torchvision.utils import save_image
 
 from losses import gram_loss, tv_loss, feat_replace, cos_loss
 from models.vgg import VGG16FeatureExtractor, VGG19FeatureExtractor
-from utils import check_folder, get_basename, str2list, images2gif, CONSOLE
+from utils import check_folder, get_basename, str2list, images2gif, LOGGER
 import tyro
 from pipeline_optimize import OptimzeBaseConfig, OptimzeBasePipeline
 
@@ -36,11 +36,9 @@ class NNFMPipeline(OptimzeBasePipeline):
     def __init__(self, config: NNFMConfig) -> None:
         super().__init__(config)
         self.config = config
-        CONSOLE.print(config)
+        LOGGER.info(config)
         check_folder(self.config.output_dir)
 
-    # def add_extra_infos(self):
-    #     return ['100x']
     
     def optimize_process(self, content_path, style_path, mask=False):
         # prepare input tensors: (1, c, h, w), (1, c, h, w)
@@ -49,7 +47,7 @@ class NNFMPipeline(OptimzeBasePipeline):
         style_image = self.transform_pre(Image.open(style_path).convert("RGB")).unsqueeze(0).to(self.device)
 
         # optimize target
-        optimze_images = []
+        optimize_images = []
         opt_img = content_image.data.clone()
         opt_img = opt_img.to(self.device)
         if mask:
@@ -69,20 +67,20 @@ class NNFMPipeline(OptimzeBasePipeline):
             
         # save init image
         out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-        optimze_images.append(out_img)
+        optimize_images.append(out_img)
 
         opt_img.requires_grad = True
         optimizer = optim.Adam([opt_img], lr=1e-1)
 
         # get target features
-        _, style_features = self.vgg.forward(style_image)
-        _, content_features = self.vgg.forward(content_image)
+        _, style_features = self.model.forward(style_image)
+        _, content_features = self.model.forward(content_image)
         s_feats = torch.cat(style_features, 1)
         c_feats = torch.cat(content_features, 1)
 
         for i in range(self.config.max_iter):
             optimizer.zero_grad()
-            _, x_features = self.vgg.forward(opt_img)
+            _, x_features = self.model.forward(opt_img)
 
             # combine feature channels
             x_feats = torch.cat(x_features, 1)
@@ -102,15 +100,15 @@ class NNFMPipeline(OptimzeBasePipeline):
 
             #print loss
             if i % self.config.show_iter == self.config.show_iter - 1:
-                CONSOLE.print(f'Iteration: {i+1}, loss: {loss.item():.4f}, nn_loss: {nn_loss.item():.4f}, content_loss: {content_loss.item():.4f}')
+                LOGGER.info(f'Iteration: {i+1}, loss: {loss.item():.4f}, nn_loss: {nn_loss.item():.4f}, content_loss: {content_loss.item():.4f}')
                 out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-                optimze_images.append(out_img)
+                optimize_images.append(out_img)
 
         # save results
         out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-        optimze_images.append(out_img)
+        optimize_images.append(out_img)
 
-        return optimze_images
+        return optimize_images
 
 
 if __name__ == '__main__':

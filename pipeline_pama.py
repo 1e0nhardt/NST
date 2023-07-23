@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import torch
 from pama.pama_model import PAMANet
-from utils import PadHelper
+from utils import ResizeHelper
 from PIL import Image
 from torchvision.transforms import transforms
 from utils import tensor2img, showimgs, save_image
@@ -47,7 +47,7 @@ if __name__ == '__main__':
     import tyro
 
     pama_config = tyro.cli(PamaConfig)
-    helper = PadHelper()
+    helper = ResizeHelper()
 
     # content_path = "data/content/frame_00001.png"
     style_path = "data/style/17.jpg"

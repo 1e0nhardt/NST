@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 
+from utils import LOGGER
+import math
+
 
 def gram_matrix(feature_maps):
     """
@@ -11,13 +14,19 @@ def gram_matrix(feature_maps):
     features = feature_maps.view(b, c, h * w)
     G = torch.bmm(features, torch.transpose(features, 1, 2))
     G.div_(h*w)
+    # logger.info('#'*80)
+    # logger.info(f'Gram Matrix Sum {G.sum()}')
+    # logger.info(f'Gram Matrix Mean {G.mean()}')
+    # logger.info(f'Gram Matrix Max {G.max()}')
+    # logger.info(f'Gram Matrix Min {G.min()}')
+    # logger.info('#'*80)
     return G
 
 
 def gram_loss(content_features, target_features, weights=[1 for n in [64,128,256,512,512]]):
     gram_loss = 0.0
     for i, (c_feats, s_feats) in enumerate(zip(content_features, target_features)):
-        gram_loss += weights[i] * torch.mean(torch.abs(gram_matrix(c_feats) - gram_matrix(s_feats)))
+        gram_loss += weights[i] * torch.mean((gram_matrix(c_feats) - gram_matrix(s_feats))**2)
     return gram_loss
 
 
@@ -26,10 +35,10 @@ def tv_loss(rgb: torch.Tensor):
     h_variance = torch.mean(torch.pow(rgb[:, :, :-1, :] - rgb[:, :, 1:, :], 2))
     return (h_variance + w_variance) / 2.0
 
-
 ###############################################################################
 ###############################arf utils#######################################
 ###############################################################################
+
 def cos_distance(a, b, center=True):
     """a: [b, c, hw],
     b: [b, c, h2w2]
@@ -57,18 +66,17 @@ def cos_distance(a, b, center=True):
     return d_mat
 
 
-def cos_loss(a, b):
-    # """cosine loss
+def cos_loss(a, b, center=True):
+    """cosine loss"""
     a_norm = (a * a).sum(1, keepdims=True).sqrt()
     b_norm = (b * b).sum(1, keepdims=True).sqrt()
-    a_tmp = a / (a_norm + 1e-8)
-    b_tmp = b / (b_norm + 1e-8)
+    
+    a_tmp = a / (a_norm)
+    b_tmp = b / (b_norm)
+
     cossim = (a_tmp * b_tmp).sum(1)
     cos_d = 1.0 - cossim
     return cos_d.mean()
-    # """
-
-    # return ((a - b) ** 2).mean()
 
 
 def feat_replace(a, b):
@@ -98,38 +106,6 @@ def feat_replace(a, b):
     z_new = torch.cat(z_new, 0)
     z_new = z_new.view(n, c, h, w)
     return z_new
-
-
-def guided_feat_replace(a, b, trgt):
-    n, c, h, w = a.size()
-    n2, c2, h2, w2 = b.size()
-    n3, c3, h3, w3 = trgt.size()
-    assert (n == 1) and (n2 == 1) and (c == c2) and (n3 == 1) and (h2 == h3) and (w2 == w3)
-
-    a_flat = a.view(n, c, -1)
-    b_flat = b.view(n2, c2, -1)
-    trgt = trgt.view(n3, c3, -1)
-
-    z_new = []
-
-    # Loop is slow but distance matrix requires a lot of memory
-    for i in range(n):
-        z_dist = cos_distance(a_flat[i : i + 1], b_flat[i : i + 1])
-
-        z_best = torch.argmin(z_dist, 2)
-        del z_dist
-
-        z_best = z_best.unsqueeze(1).repeat(1, c3, 1)
-        feat = torch.gather(trgt, 2, z_best)
-
-        z_new.append(feat)
-
-    z_new = torch.cat(z_new, 0)
-    z_new = z_new.view(n, c3, h, w)
-    return z_new
-###############################################################################
-###############################arf utils#######################################
-###############################################################################
 
 
 if __name__ == '__main__':

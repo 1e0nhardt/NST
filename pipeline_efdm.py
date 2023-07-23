@@ -6,7 +6,7 @@ from einops import rearrange, repeat
 from PIL import Image
 from torch import optim
 
-from utils import CONSOLE, check_folder, AorB
+from utils import LOGGER, check_folder, AorB
 from utils_st import exact_feature_distribution_matching
 from pipeline_optimize import OptimzeBaseConfig, OptimzeBasePipeline
 
@@ -30,7 +30,7 @@ class EFDMConfig(OptimzeBaseConfig):
 class EFDMPipeline(OptimzeBasePipeline):
     def __init__(self, config: EFDMConfig) -> None:
         super().__init__(config)
-        CONSOLE.print(config)
+        LOGGER.info(config)
         self.config = config
         check_folder(self.config.output_dir)
     
@@ -46,7 +46,7 @@ class EFDMPipeline(OptimzeBasePipeline):
         style_image = self.transform_pre(Image.open(style_path).convert("RGB")).unsqueeze(0).to(self.device)
 
         # optimize target
-        optimze_images = []
+        optimize_images = []
         opt_img = content_image.data.clone()
         opt_img = opt_img.to(self.device)
 
@@ -67,18 +67,14 @@ class EFDMPipeline(OptimzeBasePipeline):
 
         # save init image
         out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-        optimze_images.append(out_img)
+        optimize_images.append(out_img)
 
         opt_img.requires_grad = True
 
         # get target features
-        _, style_features = self.vgg.forward(style_image)
-        content_features, fs = self.vgg.forward(content_image)
+        _, style_features = self.model.forward(style_image)
+        content_features, fs = self.model.forward(content_image)
         target_features = [exact_feature_distribution_matching(fs[i], style_features[i]) for i in range(len(style_features)-1)] # 4-1
-
-        # 查看各层特征图的实际内容
-        if self.config.verbose: 
-            self.vis_feature_activations()
 
         # optimize
         optimizer = optim.LBFGS([opt_img])
@@ -88,7 +84,7 @@ class EFDMPipeline(OptimzeBasePipeline):
             def closure():
                 optimizer.zero_grad()
 
-                _, s_feats = self.vgg(opt_img)
+                _, s_feats = self.model(opt_img)
 
                 style_loss = 0
                 for i in range(len(s_feats) - 1):
@@ -114,18 +110,18 @@ class EFDMPipeline(OptimzeBasePipeline):
 
                 #print loss
                 if n_iter[0] % self.config.show_iter == 0:
-                    CONSOLE.print(f'Iteration: {n_iter[0]}, loss: {loss.item():.4f}, style_loss: {style_loss.item():.4f}, content_loss: {content_loss.item():.4f}')
+                    LOGGER.info(f'Iteration: {n_iter[0]}, loss: {loss.item():.4f}, style_loss: {style_loss.item():.4f}, content_loss: {content_loss.item():.4f}')
                     out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-                    optimze_images.append(out_img)
+                    optimize_images.append(out_img)
                 return loss
             
             optimizer.step(closure)
         
         # save final image
         out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-        optimze_images.append(out_img)
+        optimize_images.append(out_img)
         
-        return optimze_images
+        return optimize_images
 
 
 if __name__ == '__main__':
