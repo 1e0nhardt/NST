@@ -15,7 +15,7 @@ from nnst.image_pyramid import dec_lap_pyr, syn_lap_pyr
 from nnst.matting_laplacian import compute_laplacian, laplacian_loss_grad
 from pipeline_optimize import OptimzeBaseConfig, OptimzeBasePipeline
 from utils import (LOGGER, check_folder, ResizeHelper, AorB)
-from utils_st import feat_replace, nnst_fs_loss, split_downsample, calc_remd_loss
+from utils_st import feat_replace, nnst_fs_loss, split_downsample, calc_remd_loss, softmax_smoothing_2d
 
 
 # 不表明类型就不会覆盖父类的同名属性。
@@ -23,12 +23,13 @@ from utils_st import feat_replace, nnst_fs_loss, split_downsample, calc_remd_los
 class NNSTConfig(OptimzeBaseConfig):
     """NNST Arguments"""
     
-    name: str = 'nnst'
+    name: str = 'nnst_st'
     """expr name. Do not change this."""
     output_dir: str = "./results/nnst"
     """output dir"""
     model_type: str = 'vgg16'
     """feature extractor model type vgg16 | vgg19 | inception"""
+    # layers: str = "22, 20, 18"
     layers: str = "25, 18, 11, 6, 1"
     # layers: str = "22, 20, 18, 15, 13, 11, 8, 6, 3, 1"
     """layer indices of style features which should seperate by ','"""
@@ -40,22 +41,21 @@ class NNSTConfig(OptimzeBaseConfig):
     """levels of image pyramid"""
     use_content_loss: bool = False
     """use content loss or not"""
-    filp_aug: bool = False
-    """rotate image 90, 180, 270 degree, then concat them all in h dimesion"""
     lr: float = 2e-3
     max_iter: int = 200
     standardize: bool = True
-    matting_laplacian_regularizer: bool = True
+    matting_laplacian_regularizer: bool = False
     mlr_weight: int = 10
     split_downsample: bool = False
     weight_factor: float = 1.0
     use_remd_loss: bool = True
+    use_wandb: bool = False
+    entropy_reg_weight: float = 1e10
 
 
 class NNSTPipeline(OptimzeBasePipeline):
     def __init__(self, config: NNSTConfig) -> None:
         super().__init__(config)
-        LOGGER.info(config)
         self.config = config
         check_folder(self.config.output_dir)
 
@@ -63,7 +63,7 @@ class NNSTPipeline(OptimzeBasePipeline):
         return [str(self.config.alpha)+'_5layers'] + [str(self.config.weight_factor)] + AorB(self.config.split_downsample, 'split', 'stride') + AorB(self.config.matting_laplacian_regularizer, f'mlr-{self.config.mlr_weight}')
     
     def add_extra_infos(self):
-        return AorB(self.config.use_remd_loss, 'remd')
+        return AorB(self.config.use_remd_loss, 'remd') + ['perch']
     
     def optimize_process(self, content_path, style_path, mask=False):
         # 将输入张量准备好: (1, c, h, w), (1, c, h, w)
@@ -71,9 +71,9 @@ class NNSTPipeline(OptimzeBasePipeline):
         # convert("RGB")会让灰度图像也变为3通道
         style_image = self.transform_pre(Image.open(style_path).convert("RGB")).unsqueeze(0).to(self.device)
         # 日志
-        pad_helper = ResizeHelper()
-        content_image = pad_helper.pad_to8x(content_image)
-        style_image = pad_helper.pad_to8x(style_image)
+        resize_helper = ResizeHelper()
+        content_image = resize_helper.resize_to8x(content_image)
+        style_image = resize_helper.resize_to8x(style_image)
         self.writer.log_image('content', self.transform_post(content_image.squeeze().cpu()))
         self.writer.log_image('reference', self.transform_post(style_image.squeeze().cpu()))
 
@@ -221,14 +221,35 @@ class NNSTPipeline(OptimzeBasePipeline):
                             offset_b = random.randint(0, stride - 1)
                             style = style[:, :, offset_a::stride, offset_b::stride]
                             cur = cur[:, :, offset_a::stride, offset_b::stride]
+                    
                     if i == 0:
                         LOGGER.debug(f'Shape of features: {style.shape} {cur.shape}')
+                    
                     # 计算损失
-                    if self.config.use_remd_loss:
-                        loss += calc_remd_loss(style, cur)
-                    else:
-                        loss += nnst_fs_loss(style, cur)
+                    # if self.config.use_remd_loss:
+                    #     loss += calc_remd_loss(style, cur)
+                    # else:
+                    #     loss += nnst_fs_loss(style, cur)
+
+                    for c, s in zip(torch.split(cur, 1), torch.split(style, 1)):
+                        if self.config.use_remd_loss:
+                            loss += calc_remd_loss(s, c)
+                        else:
+                            loss += nnst_fs_loss(s, c)
+
+                    # LOGGER.debug('%s: mean=%.3e, var=%.3e, max=%.3e, min=%.3e', 'style feats', style.detach().mean().item(), style.detach().var().item(), style.detach().max().item(), style.detach().min().item())
+                    # style = softmax_smoothing_2d(torch.sigmoid(style))
+                    # cur = softmax_smoothing_2d(torch.sigmoid(cur))
+                    
+                    # entropy_reg_loss = self.config.entropy_reg_weight * (style * (torch.log(style) - torch.log(cur))).mean()
+                    
+                    # LOGGER.debug(entropy_reg_loss.item())
+                    # c = 0.3
+                    # robuts_erl = 2*(entropy_reg_loss/c)**2/((entropy_reg_loss/c)**2 + 4)
+                    # loss += entropy_reg_loss
+
                 # 日志
+                # LOGGER.warning(f'loss: {loss.item()}')
                 self.writer.log_scaler(f'loss of FS', loss.item())
 
             loss.backward()
@@ -242,12 +263,28 @@ class NNSTPipeline(OptimzeBasePipeline):
         output_pyramid[scale:] = dec_lap_pyr(output_image, self.config.pyramid_levels - scale)
 
 if __name__ == '__main__':
+    # x = torch.rand((6, 3, 8, 8))
+    # r = torch.split(x, 1)
+    # print(len(r))
+    # print(r[0].shape)
+    # exit()
+    import os
     args = tyro.cli(NNSTConfig)
     pipeline = NNSTPipeline(args)
+    content_dir='data/content/'
+    style_dir='data/nnst_style/'
+    # for c in os.listdir(content_dir):
+    #     for s in os.listdir(style_dir):
+    #         pipeline(
+    #             content_dir + c,
+    #             style_dir + s
+    #         )
+    # exit()
     pipeline(
         # 'data/truck/14.png', 
         'data/content/sailboat.jpg', 
         # 'data/content/C2.png', 
-        'data/nnst_style/S5.jpg',
+        # 'data/style/122.jpg',
+        'data/nnst_style/S4.jpg',
         mask=False
     )

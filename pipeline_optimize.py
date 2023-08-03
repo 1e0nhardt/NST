@@ -63,6 +63,7 @@ class OptimzeBasePipeline(object):
     def __init__(self, config: OptimzeBaseConfig) -> None:
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.config = config
+        LOGGER.info(config)
 
         # prepare model
         self.model = self.prepare_model()
@@ -88,7 +89,10 @@ class OptimzeBasePipeline(object):
     def prepare_transforms(self):
         transform_pre_list = []
         transform_post_list = []
-        transform_pre_list.append(ResizeMaxSide(self.config.max_side))
+        if self.config.name == 'nnst':
+            transform_pre_list.append(ResizeMaxSide(self.config.max_side))
+        else:
+            transform_pre_list.append(transforms.Resize((self.config.max_side, self.config.max_side)))
         transform_pre_list.append(transforms.ToTensor()) # PIL to Tensor
         # if self.config.standardize:
         #     transform_pre_list.append(transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
@@ -130,15 +134,20 @@ class OptimzeBasePipeline(object):
     
     def feat2embedding(self, feats):
         return rearrange(feats, 'n c h w -> (h w) (n c)')
+    
+    def inspect_features(self, feats, name):
+        LOGGER.debug('%s: mean=%.3e, var=%.3e, max=%.3e, min=%.3e', name, feats.detach().mean().item(), feats.detach().var().item(), feats.detach().max().item(), feats.detach().min().item())
        
     def optimize_process(self, content_path, style_path, mask=False):
         raise NotImplementedError("you must implement this method in extended class")
 
     def __call__(self, content_path: str, style_path: str, mask=False):
         expr_name = self.generate_expr_name(mask=mask)
+        filename = self.generate_filename(content_path, style_path)
         expr_dir = self.config.output_dir + '/' + expr_name
         check_folder(expr_dir)
-        LOGGER.info(f'Output Dir: {expr_dir}')
+        LOGGER.info(f'Output: {expr_dir}')
+        LOGGER.info(f'Filename: {filename}')
 
         self.time_record.reset_time()
 
@@ -147,15 +156,15 @@ class OptimzeBasePipeline(object):
         self.time_record.set_record_point('Optimization')
         self.time_record.show()
         
-        filename = self.generate_filename(content_path, style_path)
-
         if self.config.save_process:
-            images2gif(optimize_images.values(), expr_dir + f'/{filename}_process.gif')
+            images2gif(list(optimize_images.values()), expr_dir + f'/{filename}_process.gif')
 
-        if hasattr(self.config, 'max_scales'): # NNST
+        if hasattr(self.config, 'max_scales') or self.config.verbose: # NNST
             for k, img in optimize_images.items():
                 img.save(expr_dir + f'/{filename}_{k}.png')
 
+        if optimize_images.get('init', None) != None:
+            optimize_images['init'].save(expr_dir + f'/{filename}_init.png')
         optimize_images['result'].save(expr_dir + f'/{filename}_result.png')
 
         self.writer.update_cfg(Timecost=self.time_record.get_record_point('Optimization'))

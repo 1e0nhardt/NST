@@ -117,10 +117,11 @@ class ResizeHelper(object):
         w_new = (w + 7) // 8 * 8
         self.old_size = (h, w)
         self.mode = mode
-        F.interpolate(t, (h_new, w_new), mode=mode)
+        return F.interpolate(t, (h_new, w_new), mode=mode)
     
     def resize_to_original(self, t: torch.Tensor):
         assert self.old_size is not None, "this method should only use after resize_to8x()"
+        return F.interpolate(t, self.old_size, mode=self.mode)
 
     def pad_to8x(self, t: torch.Tensor, mode: str = 'reflect'):
         assert len(t.shape) == 4, "tensor shape must be [b, c, h, w]"
@@ -350,7 +351,39 @@ class Recorder(object):
     def __del__(self):
         self._file.close()
 
+recorder = Recorder()
+
+
+def generate_perlin_noise_2d(shape, res):
+    def f(t):
+        return 6*t**5 - 15*t**4 + 10*t**3
+
+    delta = (res[0] / shape[0], res[1] / shape[1])
+    d = (shape[0] // res[0], shape[1] // res[1])
+    grid = np.mgrid[0:res[0]:delta[0],0:res[1]:delta[1]].transpose(1, 2, 0) % 1
+    # Gradients
+    angles = 2*np.pi*np.random.rand(res[0]+1, res[1]+1)
+    gradients = np.dstack((np.cos(angles), np.sin(angles)))
+    g00 = gradients[0:-1,0:-1].repeat(d[0], 0).repeat(d[1], 1)
+    g10 = gradients[1:,0:-1].repeat(d[0], 0).repeat(d[1], 1)
+    g01 = gradients[0:-1,1:].repeat(d[0], 0).repeat(d[1], 1)
+    g11 = gradients[1:,1:].repeat(d[0], 0).repeat(d[1], 1)
+    # Ramps
+    n00 = np.sum(grid * g00, 2)
+    n10 = np.sum(np.dstack((grid[:,:,0]-1, grid[:,:,1])) * g10, 2)
+    n01 = np.sum(np.dstack((grid[:,:,0], grid[:,:,1]-1)) * g01, 2)
+    n11 = np.sum(np.dstack((grid[:,:,0]-1, grid[:,:,1]-1)) * g11, 2)
+    # Interpolation
+    t = f(grid)
+    n0 = n00*(1-t[:,:,0]) + t[:,:,0]*n10
+    n1 = n01*(1-t[:,:,0]) + t[:,:,0]*n11
+    return np.sqrt(2)*((1-t[:,:,1])*n0 + t[:,:,1]*n1)
+
 
 if __name__ == '__main__':
-    r = Recorder()
-    r.add_row('remd', '128x256x256', 64, 3, 3, 72, 1)
+    # r = Recorder()
+    # r.add_row('remd', '128x256x256', 64, 3, 3, 72, 1)
+
+    im = generate_perlin_noise_2d((512, 512), (4,4))
+    plt.imshow(im, cmap='gray')
+    plt.show()

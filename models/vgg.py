@@ -6,6 +6,11 @@ import torch.nn.functional as F
 import torchvision
 from PIL import Image
 from torchvision import models, transforms
+import sys
+sys.path.append('D:/MyCodes/NST')
+
+from utils_st import calc_mean_std
+from utils import ResizeMaxSide
 
 
 class VGG19FeatureExtractor(nn.Module):
@@ -75,7 +80,7 @@ class VGG16FeatureExtractor(nn.Module):
         self.model = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
         self.layers = layers
     
-    def forward(self, ix, hypercolumn=False, weight_factor=1):
+    def forward(self, ix, hypercolumn=False, weight_factor=1, normalize=True):
         x = ix.clone() # 标准化时不修改原output image的数值
         final_ix = max(self.layers)
         style_features = []
@@ -100,7 +105,8 @@ class VGG16FeatureExtractor(nn.Module):
                 break
         
         #! Normalize each layer by # channels so # of channels doesn't dominate 
-        style_features = [f/math.pow(f.shape[1], weight_factor) for f in style_features]
+        if normalize:
+            style_features = [f/math.pow(f.shape[1], weight_factor) for f in style_features]
 
         if hypercolumn:
             # resize and concat
@@ -114,16 +120,19 @@ class VGG16FeatureExtractor(nn.Module):
 
 
 if __name__ == '__main__':
+    from rich.progress import track
     from rich.console import Console
     CONSOLE = Console()
     from torch.utils.tensorboard import SummaryWriter
     from inception import InceptionFeatureExtractor
 
-    # vgg16 = VGG16FeatureExtractor().cuda()
+    vgg16 = VGG16FeatureExtractor(layers=[25,18,11,6,1], std=True).cuda()
     # vgg16 = InceptionFeatureExtractor().cuda()
-    # writer = SummaryWriter('log/image_downsample/test01')
-    image = Image.open('data/content/C2.png')
-    # image = Image.open('data/nnst_style/S4.jpg')
+    writer = SummaryWriter('log/vgg16/features/c1s4adaintarget')
+    image_c = Image.open('data/content/C1.png')
+    # image = Image.open('data/style/130.jpg')
+    image_s = Image.open('data/nnst_style/S4.jpg')
+    image_cs = Image.open('results/efdm/vgg19_adam_std_R1_100/C2_S1_0.001_result.png')
     trans = transforms.Compose([
         transforms.Resize((512, 512)),
         transforms.ToTensor(),
@@ -133,40 +142,29 @@ if __name__ == '__main__':
     transp = transforms.Compose([
         transforms.ToPILImage(),
     ])
-    x = trans(image).cuda()
-    def split_downsample(x, size):
-        outputs = []
-        for i in range(size):
-            for j in range(size):
-                outputs.append(x[:, i::size, j::size])
-        return outputs
-    outputs = split_downsample(x, 4)
+    c = trans(image_c).cuda().unsqueeze(0)
+    s = trans(image_s).cuda().unsqueeze(0)
+    cs = trans(image_cs).cuda().unsqueeze(0)
+    alpha = 0.1
+    x = ((1-alpha)*c+alpha*s)/2
+    x = cs
 
-    for i, output in enumerate(outputs):
-        o = transp(output)
-        o.save(f'results/image/output_{i}.png')
 
     # x = torch.ones([1, 3, 512, 512], device='cuda') * 2
     
-    # _, sf = vgg16(x)
+    _, cf = vgg16(c, normalize=False)
+    _, sf = vgg16(s, normalize=False)
 
-    # for i, f in enumerate(sf, 1):
+    # for i, f in track(enumerate(sf, 1)):
     #     writer.add_images('feat_image', repeat(rearrange(f, 'n c h w -> c n h w'), 'n c h w -> n (m c) h w', m=3), i, dataformats='NCHW')
-
-    # for p in vgg19.parameters():
-    #     print(p.mean())
-    # torch.manual_seed(42)
-    # x = torch.rand([1,3,256,256], device='cuda') *100
-    # x.requires_grad_(True)
-    # vgg19.to('cuda')
-    # c_feats, s_feats = vgg19(x)
-    # loss = 1e7*sum([torch.mean((s - torch.ones_like(s)*1)**2) for s in s_feats])
-    # loss.backward()
-    # for feats in s_feats:
-    #     CONSOLE.print(feats.mean().item(), feats.var().item(), feats.max().item(), feats.min().item())
-    # CONSOLE.print(x.grad.mean().item(), x.grad.var().item(), x.grad.max().item(), x.grad.min().item(), style='red')
-    # exit()
-    # print(c_feats.shape)
+    
+    i = 0
+    for cur, style in zip(cf, sf):
+        c_mean, c_std = calc_mean_std(cur)
+        s_mean, s_std = calc_mean_std(style)
+        target = ((cur - c_mean)/c_std*s_std + s_std)
+        writer.add_images('feat_image', repeat(rearrange(target, 'n c h w -> c n h w'), 'n c h w -> n (m c) h w', m=3), i, dataformats='NCHW')
+        i+=1
 
     # for i, layer in enumerate(vgg19.model):
     #     if 'MaxPool' in str(layer):

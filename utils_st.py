@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 from einops import rearrange, repeat
+from skimage.exposure import match_histograms
 from utils import LOGGER
+
 
 #! EFDM
 def exact_feature_distribution_matching(content_feat, style_feat):
@@ -15,7 +17,19 @@ def exact_feature_distribution_matching(content_feat, style_feat):
     return new_content.view(B, C, W, H)
 
 
-def calc_mean_std(feat, eps=1e-5):
+#! HM
+def histogram_matching(content_feat, style_feat):
+    assert (content_feat.size() == style_feat.size())
+    B, C, W, H = content_feat.size(0), content_feat.size(1), content_feat.size(2), content_feat.size(3)
+    x_view = content_feat.view(-1, W,H)
+    image1_temp = match_histograms(np.array(x_view.detach().clone().cpu().float().transpose(0, 2)),
+                                   np.array(style_feat.view(-1, W, H).detach().clone().cpu().float().transpose(0, 2)),
+                                   multichannel=True)
+    image1_temp = torch.from_numpy(image1_temp).float().to(content_feat.device).transpose(0, 2).view(B, C, W, H)
+    return content_feat + (image1_temp - content_feat).detach()
+
+
+def calc_mean_std(feat, eps=1e-7):
     # eps is a small value added to the variance to avoid divide-by-zero.
     size = feat.size()
     assert (len(size) == 4)
@@ -46,6 +60,70 @@ def softmax_smoothing(feats: list, threeD=False):
     feats[-2] = func(feats[-2])
     return feats
     # return list(map(func, feats))
+
+
+#! wct
+def wct(fc_fp32, fs_fp32):
+    """
+    fc: (1, c, hc, wc)
+    fs: (1, c, hs, ws)
+    """
+    # 转为double计算，提高数值精度
+    fc = fc_fp32.to(torch.float64)
+    fs = fs_fp32.to(torch.float64)
+
+    b, c, hc, wc = fc.shape
+
+    fc = fc.reshape(b, c, -1)
+    fs = fs.reshape(b, c, -1)
+
+    # center
+    ms = fs.mean(2, keepdims=True) # (1, c, 1)
+    fc = fc - fc.mean(2, keepdims=True)
+    fs = fs - ms
+
+    # 先计算协方差阵，协方差阵的奇异值分解就是特征分解。
+    # 协方差阵的特征值就是奇异值，是fc的奇异值的平方。特征矩阵就是U=V
+    # c_u, c_d, c_v_T = torch.linalg.svd(fc)
+    # c_u: (1, c, c)
+    # c_d: (1, min(c, hw))
+    # c_v_T: (1, hw, hw)
+    # 先计算协方差阵的原因是，hw通常远大于c。为了避免出现(hw x hw)的大矩阵，所以先计算协方差。
+    # 如果出现数值问题，可以在协方差阵中加上一个单位阵。
+    cov_c = torch.bmm(fc, fc.transpose(1,2)).div(fc.shape[1]-1)
+    cov_s = torch.bmm(fs, fs.transpose(1,2)).div(fs.shape[1]-1)
+    cov_c = torch.nan_to_num(cov_c)
+    cov_s = torch.nan_to_num(cov_s)
+    Ec, c_e, EcT = torch.linalg.svd(cov_c)
+    Es, s_e, EsT = torch.linalg.svd(cov_s)
+
+    k_c = c_e.shape[1]
+    for i in range(c_e.shape[1])[::-1]:
+        if c_e[0][i] > 1e-5:
+            k_c = i + 1
+            break
+    LOGGER.debug(f'k_c={k_c}')
+    # LOGGER.debug(c_e[0][-1])
+
+    # fc_hat = E @ D^-0.5 @ E^T @ fc
+    Dc = torch.diagflat(c_e.pow(-0.5)[0][:k_c]).unsqueeze(0) # (1, k_c, k_c)
+    step1 = torch.bmm(Ec[:, :, :k_c], Dc) # (1, c, k_c)
+    step2 = torch.bmm(step1, EcT[:, :k_c, :]) # (1, c, c)
+    fc_hat = torch.bmm(step2, fc) # (1, c, hc x wc)
+
+    k_s = s_e.shape[1]
+    for i in range(s_e.shape[1])[::-1]:
+        if s_e[0][i] > 1e-5:
+            k_s = i + 1
+            break
+    LOGGER.debug(f'k_s={k_s}')
+
+    Ds = torch.diagflat(s_e.pow(0.5)[0][:k_s]).unsqueeze(0) # (1, k_c, k_c)
+    step1 = torch.bmm(Es[:, :, :k_s], Ds) # (1, c, k_c)
+    step2 = torch.bmm(step1, EsT[:, :k_s, :]) # (1, c, c)
+    fcs_hat = torch.bmm(step2, fc_hat) # (1, c, hc x wc)
+    target = (fcs_hat + ms).reshape(b, c, hc, wc)
+    return target.to(torch.float32)
 
 
 def softmax_smoothing_2d(feats: torch.Tensor, T=1):
@@ -162,9 +240,12 @@ def nnst_fs_loss(A, B, center=True):
     return d_min.mean()
 
 
-def calc_remd_loss(A, B, center=True):
+def calc_remd_loss(A, B, center=True, l2=False):
     # A,B: [BCHW]
-    C = cosine_dismat(A, B, center)
+    if not l2:
+        C = cosine_dismat(A, B, center)
+    else:
+        C = l2_dismat(A, B)
     m1, _ = C.min(1) # cosine距离矩阵每列的最小值
     m2, _ = C.min(2) # cosine距离矩阵每行的最小值
     remd = torch.max(m1.mean(), m2.mean())
@@ -174,6 +255,17 @@ def calc_remd_loss(A, B, center=True):
     # recorder.save_record('peak_mem_alloc', torch.cuda.memory_allocated() / 1024**2)
     ###################################################################################
     return remd
+
+
+def l2_dismat(A, B):
+    """
+    A: (1, 1, h, w)
+    B: (1, 1, h, w)
+    """
+    _,_,h,w=A.shape
+    A = A.reshape(-1).unsqueeze(1)
+    B = B.reshape(-1).unsqueeze(0)
+    return (A - B).unsqueeze(0)
 
 
 def split_downsample(x, downsample_factor):
@@ -189,11 +281,54 @@ def split_downsample(x, downsample_factor):
 
 
 if __name__ == '__main__':
-    # x = torch.rand(1, 3, 3, 3)
-    # print(x)
-    # print(x.sum())
-    # print(x.shape)
+    torch.manual_seed(42)
+    x = torch.rand(1, 6, 256, dtype=torch.float32)
 
-    # print(softmax_smoothing([x])[0].sum())
+    # AA^T定实对称矩阵。一定可以被正交对角化。
+    co_u, co_d, co_v_T = torch.linalg.svd(torch.bmm(x, x.transpose(1,2)))
+    c_u, c_d, c_v_T = torch.linalg.svd(x)
+    print(co_d)
+    print(co_u.shape)
+    print(co_d.shape)
+    print(co_v_T.shape)
+    print(co_d ** 2)
 
-    print(get_gaussian_kernel(3, 5))
+    print(co_u)
+    print(co_v_T)
+    # print(torch.allclose(abs(co_u), abs(c_u), atol=1e-7))
+    # print(co_u)
+    # print(c_u)
+    # print(torch.isclose(c_u, co_u))
+    # print(torch.bmm(c_u, c_u.transpose(1,2)))
+    # c_u[0, :, 4] *=-1
+    # print(torch.bmm(c_u, co_v_T))
+    exit()
+
+    ret = [0, 0, 0]
+    for i in range(1000):
+        x = torch.rand(1, 6, 9, dtype=torch.float32)
+
+        # AA^T定实对称矩阵。一定可以被正交对角化。
+        c_u, c_d, c_v_T = torch.linalg.svd(torch.bmm(x, x.transpose(1,2)))
+        # print(c_u)
+        # print(c_v_T)
+        if torch.allclose(c_u, c_v_T.transpose(1,2), atol=1e-8): # False
+            ret[0] += 1
+        if torch.allclose(c_u, c_v_T.transpose(1,2), atol=1e-7): # True
+            ret[1] += 1
+        if torch.allclose(c_u, c_v_T.transpose(1,2), atol=1e-6): # True
+            ret[2] += 1
+        # print(torch.bmm(c_u, c_v_T)) # 并不是单位阵，由于数值原因，有约1e-7左右的误差。
+    print(ret)
+    exit()
+
+    # 默认some=True，返回简化的奇异值分解。 返回U S V
+    ret1 = torch.svd(x, some=False) 
+    # full_matrices = not some，默认为True。返回U S V^H
+    ret2 = torch.linalg.svd(x, full_matrices=True)
+    print(ret1[0] == ret2[0])
+    print(ret1[1] == ret2[1])
+    print(ret1[2] == ret2[2].transpose(1, 2))
+
+    print(torch.eye(4))
+
