@@ -1,8 +1,6 @@
 import torch
-import torch.nn as nn
 
 from utils import LOGGER
-import math
 
 
 def gram_matrix(feature_maps):

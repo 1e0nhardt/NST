@@ -1,21 +1,23 @@
-from typing import Sequence
-from PIL import Image
-import imageio
-import numpy as np
-import time
-import torch
-import itertools
-from rich.console import Console
-from rich.table import Table
-import matplotlib.pyplot as plt
-import matplotlib as mpl
 import inspect
-import os
-import torch.nn.functional as F
-from torchvision.transforms.functional import InterpolationMode, _interpolation_modes_from_int, resize, get_dimensions
+import itertools
 import logging
-from rich.logging import RichHandler
+import os
+import time
+from typing import Sequence
 
+import imageio
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from rich.console import Console
+from rich.logging import RichHandler
+from rich.table import Table
+from torchvision.transforms.functional import (InterpolationMode,
+                                               _interpolation_modes_from_int,
+                                               get_dimensions, resize)
 
 CONSOLE = Console()
 

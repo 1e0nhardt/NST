@@ -1,9 +1,7 @@
-import io
 import random
-from collections import OrderedDict
 from dataclasses import dataclass
-import numpy as np
 
+import numpy as np
 import torch
 import torch.nn as nn
 import tyro
@@ -14,8 +12,9 @@ from losses import cos_loss
 from nnst.image_pyramid import dec_lap_pyr, syn_lap_pyr
 from nnst.matting_laplacian import compute_laplacian, laplacian_loss_grad
 from pipeline_optimize import OptimzeBaseConfig, OptimzeBasePipeline
-from utils import (LOGGER, check_folder, ResizeHelper, AorB)
-from utils_st import feat_replace, nnst_fs_loss, split_downsample, calc_remd_loss, softmax_smoothing_2d
+from utils import LOGGER, AorB, ResizeHelper, check_folder
+from utils_st import (calc_remd_loss, feat_replace, nnst_fs_loss,
+                      split_downsample)
 
 
 # 不表明类型就不会覆盖父类的同名属性。
@@ -23,10 +22,8 @@ from utils_st import feat_replace, nnst_fs_loss, split_downsample, calc_remd_los
 class NNSTConfig(OptimzeBaseConfig):
     """NNST Arguments"""
     
-    name: str = 'nnst_st'
+    name: str = 'nnst'
     """expr name. Do not change this."""
-    output_dir: str = "./results/nnst"
-    """output dir"""
     model_type: str = 'vgg16'
     """feature extractor model type vgg16 | vgg19 | inception"""
     # layers: str = "22, 20, 18"
@@ -60,12 +57,12 @@ class NNSTPipeline(OptimzeBasePipeline):
         check_folder(self.config.output_dir)
 
     def add_extra_file_infos(self):
-        return [str(self.config.alpha)+'_5layers'] + [str(self.config.weight_factor)] + AorB(self.config.split_downsample, 'split', 'stride') + AorB(self.config.matting_laplacian_regularizer, f'mlr-{self.config.mlr_weight}')
+        return [str(self.config.alpha)] + [str(self.config.weight_factor)] + AorB(self.config.split_downsample, 'split', 'stride') + AorB(self.config.matting_laplacian_regularizer, f'mlr-{self.config.mlr_weight}')
     
     def add_extra_infos(self):
-        return AorB(self.config.use_remd_loss, 'remd') + ['perch']
+        return AorB(self.config.use_remd_loss, 'remd')
     
-    def optimize_process(self, content_path, style_path, mask=False):
+    def optimize_process(self, content_path, style_path):
         # 将输入张量准备好: (1, c, h, w), (1, c, h, w)
         content_image = self.transform_pre(Image.open(content_path)).unsqueeze(0).to(self.device)
         # convert("RGB")会让灰度图像也变为3通道
@@ -77,8 +74,6 @@ class NNSTPipeline(OptimzeBasePipeline):
         self.writer.log_image('content', self.transform_post(content_image.squeeze().cpu()))
         self.writer.log_image('reference', self.transform_post(style_image.squeeze().cpu()))
 
-        # 存储中间输出图片
-        optimize_images = OrderedDict()
         # 构建图像金字塔
         style_pyramid = dec_lap_pyr(style_image, self.config.pyramid_levels)
         content_pyramid = dec_lap_pyr(content_image, self.config.pyramid_levels)
@@ -122,11 +117,11 @@ class NNSTPipeline(OptimzeBasePipeline):
                 # 用内容的高频特征作为寻找特征的起点
                 output_init = syn_lap_pyr([content_pyramid[scale]] + output_pyramid[(scale + 1):])
                 # 提取参考图片特征 | 可以使用旋转增强flip_aug
-                _, style_hypercolumns = self.model(style_image_tmp, hypercolumn=True, weight_factor=self.config.weight_factor)
+                _, style_hypercolumns = self.model(style_image_tmp, hypercolumn=True, weight_factor=self.config.weight_factor, normalize=True)
                 # 将内容图和低分辨率下优化过的结果混合
                 fuse_content = (1 - alpha) * content_image_tmp + alpha * output_init
                 # 提混合内容特征
-                _, content_hypercolumns = self.model(fuse_content, hypercolumn=True, weight_factor=self.config.weight_factor)
+                _, content_hypercolumns = self.model(fuse_content, hypercolumn=True, weight_factor=self.config.weight_factor, normalize=True)
                 # 使用参考图的特征替换最近邻内容特征，得到优化的目标特征
                 target_feats = feat_replace(content_hypercolumns, style_hypercolumns)
 
@@ -141,7 +136,7 @@ class NNSTPipeline(OptimzeBasePipeline):
 
             with torch.no_grad(): # 保存初始图像
                 if scale == self.config.max_scales - 1 and False:
-                    optimize_images[f'HM_init'] = syn_lap_pyr(output_pyramid)
+                    self.optimize_images[f'HM_init'] = syn_lap_pyr(output_pyramid)
                     self.writer.log_image(f'HM_init', self.transform_post(syn_lap_pyr(output_pyramid).squeeze()))
 
             #! 在当前分辨率下用Hypercolumn Matching优化输出图像
@@ -149,7 +144,7 @@ class NNSTPipeline(OptimzeBasePipeline):
 
             with torch.no_grad(): # 保存中间优化结果
                 if scale == 0:
-                    optimize_images[f'HM_{scale}'] = syn_lap_pyr(output_pyramid)
+                    self.optimize_images[f'HM_{scale}'] = syn_lap_pyr(output_pyramid)
                     self.writer.log_image(f'HM_{scale}', self.transform_post(syn_lap_pyr(output_pyramid).squeeze()))
 
         #! 在最高分辨率下用Feature Split优化输出图像
@@ -157,18 +152,17 @@ class NNSTPipeline(OptimzeBasePipeline):
         self.optimize_output(output_pyramid, None, scale, style_image, final_pass=True, matting_laplacian=matting_laplacian)
 
         with torch.no_grad(): # 保存最终输出
-            optimize_images[f'result'] = syn_lap_pyr(output_pyramid)
+            self.optimize_images[f'result'] = syn_lap_pyr(output_pyramid)
             self.writer.add_image(f'result_img', torch.clamp(syn_lap_pyr(output_pyramid).squeeze(), 0, 1))
             self.writer.log_image('result', self.transform_post(syn_lap_pyr(output_pyramid).squeeze()))
         
         # 日志
-        for k, v in optimize_images.items():
+        for k, v in self.optimize_images.items():
             for i in range(3):
                 self.writer.add_histogram(k, v.detach()[0][i].reshape(-1))
-            LOGGER.info('%s: mean=%.3e, var=%.3e, max=%.3e, min=%.3e', k, v.detach().mean().item(), v.detach().var().item(), v.detach().max().item(), v.detach().min().item())
-            optimize_images[k] = self.transform_post(v.detach().cpu().squeeze())
+            self.inspect_features(v, k)
+            self.optimize_images[k] = self.tensor2pil(v)
         
-        return optimize_images
     
     def optimize_output(self, output_pyramid, target_feats, scale, style_image=None, final_pass=False, matting_laplacian=None):
         # 将当前尺度下的图像金字塔设为优化对象
@@ -177,7 +171,7 @@ class NNSTPipeline(OptimzeBasePipeline):
 
         if final_pass: # FS需要重新提取各个尺度的特征
             assert style_image is not None, 'You should pass style image in final pass'
-            _, style_features = self.model(style_image, weight_factor=self.config.weight_factor)
+            _, style_features = self.model(style_image, weight_factor=self.config.weight_factor, normalize=True)
 
         #! 优化过程
         # iter_num = self.config.max_iter if not final_pass else 500
@@ -198,14 +192,14 @@ class NNSTPipeline(OptimzeBasePipeline):
 
             if not final_pass:
                 # HM
-                _, cur_feats = self.model(output_image, hypercolumn=True, weight_factor=self.config.weight_factor)
+                _, cur_feats = self.model(output_image, hypercolumn=True, weight_factor=self.config.weight_factor, normalize=True)
                 # 计算损失
                 loss += cos_loss(target_feats, cur_feats)
                 # 日志
                 self.writer.log_scaler(f'loss at scale {scale}', loss.item())
             else:
                 # FS
-                _, cur_feats = self.model(output_image, weight_factor=self.config.weight_factor)
+                _, cur_feats = self.model(output_image, weight_factor=self.config.weight_factor, normalize=True)
                 # 每一层的特征分别找最近邻并计算cosine距离
                 for cur, style in zip(cur_feats, style_features):
                     # 如果特征图宽高太大，则进行稀疏采样
@@ -226,27 +220,10 @@ class NNSTPipeline(OptimzeBasePipeline):
                         LOGGER.debug(f'Shape of features: {style.shape} {cur.shape}')
                     
                     # 计算损失
-                    # if self.config.use_remd_loss:
-                    #     loss += calc_remd_loss(style, cur)
-                    # else:
-                    #     loss += nnst_fs_loss(style, cur)
-
-                    for c, s in zip(torch.split(cur, 1), torch.split(style, 1)):
-                        if self.config.use_remd_loss:
-                            loss += calc_remd_loss(s, c)
-                        else:
-                            loss += nnst_fs_loss(s, c)
-
-                    # LOGGER.debug('%s: mean=%.3e, var=%.3e, max=%.3e, min=%.3e', 'style feats', style.detach().mean().item(), style.detach().var().item(), style.detach().max().item(), style.detach().min().item())
-                    # style = softmax_smoothing_2d(torch.sigmoid(style))
-                    # cur = softmax_smoothing_2d(torch.sigmoid(cur))
-                    
-                    # entropy_reg_loss = self.config.entropy_reg_weight * (style * (torch.log(style) - torch.log(cur))).mean()
-                    
-                    # LOGGER.debug(entropy_reg_loss.item())
-                    # c = 0.3
-                    # robuts_erl = 2*(entropy_reg_loss/c)**2/((entropy_reg_loss/c)**2 + 4)
-                    # loss += entropy_reg_loss
+                    if self.config.use_remd_loss:
+                        loss += calc_remd_loss(style, cur)
+                    else:
+                        loss += nnst_fs_loss(style, cur)
 
                 # 日志
                 # LOGGER.warning(f'loss: {loss.item()}')
@@ -285,6 +262,5 @@ if __name__ == '__main__':
         'data/content/sailboat.jpg', 
         # 'data/content/C2.png', 
         # 'data/style/122.jpg',
-        'data/nnst_style/S4.jpg',
-        mask=False
+        'data/nnst_style/S4.jpg'
     )

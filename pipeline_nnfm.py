@@ -1,26 +1,15 @@
-from collections import OrderedDict
-from dataclasses import dataclass
 import random
-from typing import Any
+from dataclasses import dataclass
 
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-from einops import rearrange, repeat
+import tyro
 from PIL import Image
 from torch import optim
-from torch.autograd import Variable
-from torchvision import models, transforms
-from torchvision.utils import save_image
 
-
-from losses import gram_loss, tv_loss, feat_replace, cos_loss
-from models.vgg import VGG16FeatureExtractor, VGG19FeatureExtractor
-from utils import AorB, ResizeHelper, check_folder, get_basename, str2list, images2gif, LOGGER
-import tyro
+from losses import cos_loss, feat_replace, gram_loss, tv_loss
 from pipeline_optimize import OptimzeBaseConfig, OptimzeBasePipeline
+from utils import LOGGER, AorB, ResizeHelper, check_folder
 from utils_st import calc_remd_loss, nnst_fs_loss, split_downsample
 
 
@@ -28,8 +17,7 @@ from utils_st import calc_remd_loss, nnst_fs_loss, split_downsample
 class NNFMConfig(OptimzeBaseConfig):
     """NNFM Arguments"""
 
-    output_dir: str = "./results/nnfm"
-    """output dir"""
+    name: str = 'nnfm'
     model_type: str = 'vgg16'
     # layers: str = "11,13,15"
     layers: str = "25, 18, 11, 6, 1"
@@ -40,7 +28,7 @@ class NNFMConfig(OptimzeBaseConfig):
     use_remd_loss: bool = True
     weight_factor: float = 1
     split_downsample: bool = False
-    use_wandb: bool = False
+    save_init: bool = True
 
 
 class NNFMPipeline(OptimzeBasePipeline):
@@ -51,12 +39,12 @@ class NNFMPipeline(OptimzeBasePipeline):
         self.kl_loss = nn.KLDivLoss()
 
     def add_extra_file_infos(self):
-        return [str(self.config.weight_factor)] + AorB(self.config.split_downsample, 'split', 'stride') + [str(self.config.method)]
+        return [str(self.config.weight_factor)] + AorB(self.config.split_downsample, 'split', 'stride') + [str(self.config.method)] + ['a0.2']
     
     def add_extra_infos(self):
-        return AorB(self.config.use_remd_loss, 'remd') + ['cinit_tvloss_l2']
+        return AorB(self.config.use_remd_loss, 'remd') + ['cinit']
     
-    def optimize_process(self, content_path, style_path, mask=False):
+    def optimize_process(self, content_path, style_path):
         # prepare input tensors: (1, c, h, w), (1, c, h, w)
         content_image = self.transform_pre(Image.open(content_path)).unsqueeze(0).to(self.device)
         # convert("RGB")会让灰度图像也变为3通道
@@ -65,67 +53,47 @@ class NNFMPipeline(OptimzeBasePipeline):
         content_image = resize_helper.resize_to8x(content_image)
         style_image = resize_helper.resize_to8x(style_image)
 
-        # optimize target
-        optimize_images = OrderedDict()
+        # init
         opt_img = content_image.data.clone()
-        alpha = 0.0
-        opt_img = (1-alpha)*opt_img + alpha*style_image.data.clone()
+        opt_img = self.lerp(opt_img, style_image.clone(), 0.2)
+        # opt_img = (1-alpha)*opt_img + alpha*style_image.data.clone()
         # opt_img[:,:,-150:,-150:] = (opt_img[:,:,-150:,-150:] + style_image.data.clone()[:,:,-150:,-150:])/2
         # opt_img = torch.rand_like(content_image)
         opt_img = opt_img.to(self.device)
-        if mask:
-            opt_img = self.transform_pre(Image.open(
-                self.generate_expr_name()+f"/{self.generate_filename(content_path, style_path)}_result.png"
-            )).unsqueeze(0).to(self.device)
 
-            # generate mask
-            # erase_mask = torch.zeros_like(opt_img[0, 0])
-            # erase_mask[0:300, 0:300] = 1
-            # erase_mask = (erase_mask == 1)
-            # erase_mask = erase_mask[None, None, ...]
-            # self.erase_mask = repeat(erase_mask, 'b c h w -> b (r c) h w', r=3)
-            self.erase_mask = torch.rand_like(opt_img) > 0.4
-
-            opt_img[self.erase_mask] = content_image[self.erase_mask]
-            
         # save init image
-        out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-        optimize_images['init'] = out_img
+        self.optimize_images['init'] = self.tensor2pil(opt_img)
 
         opt_img.requires_grad = True
         optimizer = optim.Adam([opt_img], lr=self.config.lr)
 
         # get target features
-        _, style_features = self.model.forward(style_image, hypercolumn=self.config.method == 'HM')
-        _, content_features = self.model.forward(content_image, hypercolumn=self.config.method == 'HM')
-        s_feats = style_features
-        c_feats = content_features
-        # s_feats = torch.cat(style_features, 1)
-        # c_feats = torch.cat(content_features, 1)
+        _, style_features = self.model.forward(style_image, hypercolumn=self.config.method == 'HM', normalize=False)
+        _, content_features = self.model.forward(content_image, hypercolumn=self.config.method == 'HM', normalize=False)
+        
         if self.config.method == 'HM':
-            target_feats = feat_replace(c_feats, s_feats)
+            target_feats = feat_replace(content_features, style_features)
 
         for i in range(self.config.max_iter):
             optimizer.zero_grad()
 
             loss = 0
             if self.config.method == 'HM':
-                _, x_features = self.model.forward(opt_img, hypercolumn=True)
-
-                # combine feature channels
-                x_feats = x_features
-                # x_feats = torch.cat(x_features, 1)
+                _, x_features = self.model.forward(opt_img, hypercolumn=True, normalize=False)
 
                 # calc losses
-                nn_loss = cos_loss(x_feats, target_feats)
+                nn_loss = cos_loss(x_features, target_feats)
                 # content_loss = torch.mean((c_feats - x_feats) ** 2)
                 # total_variance_loss = tv_loss(opt_img)
                 loss = nn_loss# + 1e-4 * content_loss + total_variance_loss
-                (x_feats, target_feats)
                 # loss += 1e-3 * self.kl_loss(x_feats, target_feats)
+
             elif self.config.method == 'FS':
-                _, cur_feats = self.model(opt_img, weight_factor=self.config.weight_factor)
+                _, cur_feats = self.model(opt_img, weight_factor=self.config.weight_factor, normalize=False)
                     # 每一层的特征分别找最近邻并计算cosine距离
+
+                loss += gram_loss(cur_feats, style_features)
+
                 for cur, style in zip(cur_feats, style_features):
                     # 如果特征图宽高太大，则进行稀疏采样
                     if max(cur.size(2), cur.size(3)) > 64:
@@ -140,46 +108,41 @@ class NNFMPipeline(OptimzeBasePipeline):
                             offset_b = random.randint(0, stride - 1)
                             style = style[:, :, offset_a::stride, offset_b::stride]
                             cur = cur[:, :, offset_a::stride, offset_b::stride]
+
                     if i == 0:
                         LOGGER.debug(f'Shape of features: {style.shape} {cur.shape}')
-                    # 计算损失
-                    # if self.config.use_remd_loss:
-                    #     loss += calc_remd_loss(style, cur)
-                    # else:
-                    #     loss += nnst_fs_loss(style, cur)
-                    for c, s in zip(torch.split(cur, 1, dim=1), torch.split(style, 1, dim=1)):
-                        if self.config.use_remd_loss:
-                            loss += calc_remd_loss(s, c, l2=True)
-                        else:
-                            loss += nnst_fs_loss(s, c)
-                    
-                    # loss += 1e1 * (style * (torch.log(style) - torch.log(cur))).mean()
 
-            total_variance_loss = tv_loss(opt_img)
-            loss += 10 * total_variance_loss
+                    # 计算损失
+                    if self.config.use_remd_loss:
+                        loss += calc_remd_loss(style, cur)
+                    else:
+                        loss += nnst_fs_loss(style, cur)
+
+                    # 不可行，因为如果分开计算，则每个滤波器都需要保存一个距离矩阵，因为梯度下降需要。但这样对显存大小要求极高。
+                    # for c, s in zip(torch.split(cur, 1, dim=1), torch.split(style, 1, dim=1)):
+                    #     if self.config.use_remd_loss:
+                    #         loss += calc_remd_loss(s, c, l2=True)
+                    #     else:
+                    #         loss += nnst_fs_loss(s, c)
+
+            # total_variance_loss = tv_loss(opt_img)
+            # loss += 10 * total_variance_loss
+            loss.backward()
+            optimizer.step()
+
             # 日志
             self.writer.log_scaler(f'loss of {self.config.method}', loss.item())
 
-            loss.backward()
-            self.writer.log_scaler('loss', loss.item())
-            # 将不需要优化的区域的梯度置为零
-            if mask:
-                opt_img.grad[~self.erase_mask] = 0 
-            optimizer.step()
-
             #print loss
             if i % self.config.show_iter == self.config.show_iter - 1:
-                LOGGER.info(f'Iteration: {i+1}, loss: {loss.item():.4f}, tv_loss: {total_variance_loss.item():.1e}')
-                # LOGGER.info(f'Iteration: {i+1}, loss: {loss.item():.4f}, nn_loss: {nn_loss.item():.4f}, content_loss: {content_loss.item():.4f}')
-                out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-                optimize_images[f'iter_{i}'] = out_img
+                LOGGER.info(f'Iteration: {i+1}, loss: {loss.item():.4f}')
+                # LOGGER.info(f'Iteration: {i+1}, loss: {loss.item():.4f}, tv_loss: {total_variance_loss.item():.1e}')
+                self.optimize_images[f'iter_{i}'] = self.tensor2pil(opt_img)
 
         # save results
-        out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-        optimize_images['result'] = out_img
+        out_img = self.tensor2pil(opt_img)
+        self.optimize_images['result'] = out_img
         self.writer.log_image('result', out_img)
-
-        return optimize_images
 
 
 if __name__ == '__main__':
@@ -196,6 +159,6 @@ if __name__ == '__main__':
     pipeline(
         # 'data/content/C1.png', 
         'data/content/sailboat.jpg', 
-        'data/nnst_style/shape.png',
-        # 'data/style/17.jpg',
+        # 'data/nnst_style/shape.png',
+        'data/style/6.jpg',
     )

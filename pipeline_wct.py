@@ -1,25 +1,21 @@
-from collections import OrderedDict
 from dataclasses import dataclass
 
 import torch
 import tyro
-from einops import rearrange, repeat
 from PIL import Image
 from torch import optim
 
 from losses import gram_loss, tv_loss
 from nnst.image_pyramid import dec_lap_pyr, syn_lap_pyr
-from utils import LOGGER, AorB, check_folder
-from utils_st import exact_feature_distribution_matching, softmax_smoothing, get_gaussian_conv, softmax_smoothing_2d, wct
 from pipeline_optimize import OptimzeBaseConfig, OptimzeBasePipeline
-import math
+from utils import LOGGER, AorB, check_folder
+from utils_st import exact_feature_distribution_matching, wct
+
 
 @dataclass
 class WCTConfig(OptimzeBaseConfig):
 
     name: str = 'wct'
-    output_dir: str = "./results/wct"
-    """output dir"""
     model_type: str = 'vgg16'
     """feature extractor model type vgg16 | vgg19 | inception"""
     layers: str = "18"
@@ -50,14 +46,11 @@ class WCTPipeline(OptimzeBasePipeline):
     def add_extra_file_infos(self):
         return [self.config.layers] + ['sinit']
     
-    def optimize_process(self, content_path, style_path, mask=False):
+    def optimize_process(self, content_path, style_path):
         # prepare input tensors: (1, c, h, w), (1, c, h, w)
         content_image = self.transform_pre(Image.open(content_path)).unsqueeze(0).to(self.device)
         # convert("RGB")会让灰度图像也变为3通道
         style_image = self.transform_pre(Image.open(style_path).convert("RGB")).unsqueeze(0).to(self.device)
-
-        # optimize target
-        optimize_images = OrderedDict()
 
         # style_image = (content_image.clone() + style_image.clone())/2
         # opt_img = style_image.data.clone()
@@ -76,10 +69,6 @@ class WCTPipeline(OptimzeBasePipeline):
         # get target features
         _, style_features = self.model.forward(style_image)
         content_features, fs = self.model.forward(content_image)
-
-        for cur in style_features:
-            # * cur.shape[1] 是补偿vgg16中的分层加权操作
-            cur *= cur.shape[1]
 
         target_features = []
 
@@ -108,11 +97,7 @@ class WCTPipeline(OptimzeBasePipeline):
 
                 # content_loss = torch.mean((c_feats - content_features) ** 2)
                 loss = 0
-                for cur in s_feats:
-                    #* cur.shape[1] 是补偿vgg16中的分层加权操作
-                    cur *= cur.shape[1]
                 
-                total_variance_loss = tv_loss(opt_img)
 
                 # target_features = []
                 # for c, s in zip(s_feats, style_features):
@@ -127,27 +112,26 @@ class WCTPipeline(OptimzeBasePipeline):
                     # entropy_reg_loss = 1e3 * (style * (torch.log(style) - torch.log(cur))).mean()
                     # loss += entropy_reg_loss
                 
-                if self.config.use_tv_loss:
+                if self.config.use_tv_reg:
+                    total_variance_loss = tv_loss(opt_img)
                     loss += 100 * total_variance_loss
 
                 loss.backward()
 
                 n_iter[0] += 1
+
                 #print loss
                 if n_iter[0] % self.config.show_iter == 0:
                     print(f'Iteration: {n_iter[0]}, loss: {loss.item():.4f}')
                     out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-                    optimize_images[str(n_iter[0]//self.config.show_iter)] = out_img
+                    self.optimize_images[str(n_iter[0]//self.config.show_iter)] = out_img
                 return loss
             
             optimizer.step(closure)
         
         # save final image
         opt_img = syn_lap_pyr(opt_vars)
-        out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-        optimize_images['result'] = out_img
-        
-        return optimize_images
+        self.optimize_images['result'] = self.tensor2pil(opt_img)
 
     
 if __name__ == '__main__':
@@ -155,7 +139,6 @@ if __name__ == '__main__':
     pipeline = WCTPipeline(args)
     pipeline(
         'data/content/sailboat.jpg', 
-        'data/nnst_style/S4.jpg',
-        mask=False
+        'data/nnst_style/S4.jpg'
     )
     

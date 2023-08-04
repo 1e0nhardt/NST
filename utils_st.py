@@ -1,8 +1,11 @@
+import gc
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 from einops import rearrange, repeat
 from skimage.exposure import match_histograms
+
 from utils import LOGGER
 
 
@@ -34,9 +37,9 @@ def calc_mean_std(feat, eps=1e-7):
     size = feat.size()
     assert (len(size) == 4)
     N, C = size[:2]
-    feat_var = feat.view(N, C, -1).var(dim=2) + eps
-    feat_std = feat_var.sqrt().view(N, C, 1, 1)
-    feat_mean = feat.view(N, C, -1).mean(dim=2).view(N, C, 1, 1)
+    feat_var = feat.reshape(N, C, -1).var(dim=2) + eps
+    feat_std = feat_var.sqrt().reshape(N, C, 1, 1)
+    feat_mean = feat.reshape(N, C, -1).mean(dim=2).reshape(N, C, 1, 1)
     return feat_mean, feat_std
 
 
@@ -241,6 +244,8 @@ def nnst_fs_loss(A, B, center=True):
 
 
 def calc_remd_loss(A, B, center=True, l2=False):
+    # gc.collect()
+    # torch.cuda.empty_cache()
     # A,B: [BCHW]
     if not l2:
         C = cosine_dismat(A, B, center)
@@ -249,6 +254,9 @@ def calc_remd_loss(A, B, center=True, l2=False):
     m1, _ = C.min(1) # cosine距离矩阵每列的最小值
     m2, _ = C.min(2) # cosine距离矩阵每行的最小值
     remd = torch.max(m1.mean(), m2.mean())
+    # del C
+    # gc.collect() # 极其影响速度
+    # torch.cuda.empty_cache()
     ##################################测试用###########################################
     # print_gpu_mem()
     # recorder.save_record('dmat_mem_alloc', calc_mem_allocated(C))
@@ -263,9 +271,13 @@ def l2_dismat(A, B):
     B: (1, 1, h, w)
     """
     _,_,h,w=A.shape
+    A_mean, A_std = calc_mean_std(A)
+    B_mean, B_std = calc_mean_std(B)
+    A = (A - A_mean)/A_std
+    B = (B - B_mean)/B_std
     A = A.reshape(-1).unsqueeze(1)
     B = B.reshape(-1).unsqueeze(0)
-    return (A - B).unsqueeze(0)
+    return (A - B).unsqueeze(0) ** 2
 
 
 def split_downsample(x, downsample_factor):

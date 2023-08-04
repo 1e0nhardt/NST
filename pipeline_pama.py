@@ -50,7 +50,7 @@ if __name__ == '__main__':
     helper = ResizeHelper()
 
     # content_path = "data/content/frame_00001.png"
-    style_path = "data/nnst_style/S4.jpg"
+    style_path = "data/nnst_style/S1.jpg"
     # style_path = "data/style/17.jpg"
 
     transform = transforms.Compose([
@@ -76,6 +76,8 @@ if __name__ == '__main__':
     st_images = []
     for content_path in os.listdir('data/content'):
         Ic = transform(Image.open(f'data/content/{content_path}').convert("RGB")).unsqueeze(0)
+        # Ic = torch.rand_like(Ic)
+        # Ic = 0.8*Ic + 0.2*torch.rand_like(Ic)
         name = os.path.basename(content_path)
 
         padded_image = helper.pad_to8x(Ic)
@@ -90,7 +92,7 @@ if __name__ == '__main__':
         # save_image(style_transferred_image, f'results/lego/{name}_14.jpg')
     
     grid = make_grid(torch.cat(st_images), nrow=4, pad_value=1)
-    save_image(grid, f'grid_{pama_config.input_range}_S4.png')
+    save_image(grid, f'grid_{pama_config.input_range}_S1_0.png')
 
 
 

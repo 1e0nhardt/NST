@@ -1,21 +1,23 @@
-from functools import wraps
 import time
 import typing
-from dataclasses import dataclass, asdict
+from collections import OrderedDict
+from dataclasses import asdict, dataclass
+from functools import wraps
 
 import torch
 from einops import rearrange, repeat
 from rich.traceback import install
+from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 
+import wandb
 from models.inception import InceptionFeatureExtractor
 from models.vgg import VGG16FeatureExtractor, VGG19FeatureExtractor
-from utils import (AorB, ResizeMaxSide, TimeRecorder, check_folder,
-                   get_basename, images2gif, LOGGER, str2list)
-from torch.utils.tensorboard import SummaryWriter
-import wandb
+from utils import (LOGGER, AorB, ResizeMaxSide, TimeRecorder, check_folder,
+                   get_basename, images2gif, str2list)
 
 install(show_locals=False) # 设置rich为默认的异常输出处理程序
+
 
 @dataclass
 class OptimzeBaseConfig:
@@ -31,29 +33,31 @@ class OptimzeBaseConfig:
     """optimize steps"""
     show_iter: int = 50
     """frequencies to show current loss"""
-    model_type: str = 'vgg19'
-    """feature extractor model type vgg16 | vgg19 | inception"""
-    layers: str = "1,6,11,20,29"
+    model_type: str = 'vgg16'
+    """feature extractor model type vgg16 | vgg19 | inception. Generally, vgg16 is enough."""
+    layers: str = "1,6,11,18,25"
     """layer indices of style features which should seperate by ','"""
     optimizer: str = 'adam'
     """optimizer type: adam | lbfgs"""
     lr: float = 1e-3
     """learning rate"""
-    use_softmax_smoothing: bool = False
-    """use softmax smoothing to avoid peaky activations of low entropy. From <Rethinking and Improving the Robustness of Image Style Transfer>"""
     standardize: bool = True
     """use ImageNet mean to standardization"""
     input_range: float = 1
-    """scale number range after normalization and standardization"""
-    use_in: bool = False
-    """apply instance normalization on all style feature maps"""
+    """scale number range. default 1."""
     max_side: int = 512
     """max side length of resized image"""
+    exact_resize: tuple = (512, 512)
+    """exact size of inputs"""
+    use_tv_reg: bool = False
+    """use total variance regularizer"""
+    save_init: bool = False
+    """save init image"""
     save_process: bool = False
     """save images of optimize process as gif"""
     verbose: bool = False
     """show additional information"""
-    use_wandb: bool = True
+    use_wandb: bool = False
     """use wandb"""
     use_tensorboard: bool = False
     """use tensorboard"""
@@ -71,9 +75,10 @@ class OptimzeBasePipeline(object):
         # prepare transforms
         self.transform_pre, self.transform_post = self.prepare_transforms()
 
+        # loggers
         self.time_record = TimeRecorder(self.config.output_dir.split('/')[-1])
-
         self.writer = ExprWriter(config, self.generate_expr_name())
+        self.optimize_images = OrderedDict()
     
     def prepare_model(self) -> typing.Union[VGG16FeatureExtractor, VGG19FeatureExtractor, InceptionFeatureExtractor]:
         if self.config.model_type == 'vgg19':
@@ -87,6 +92,7 @@ class OptimzeBasePipeline(object):
         return model
     
     def prepare_transforms(self):
+        """prepare transforms for preprocess image and postprocess image"""
         transform_pre_list = []
         transform_post_list = []
         if self.config.name == 'nnst':
@@ -94,9 +100,6 @@ class OptimzeBasePipeline(object):
         else:
             transform_pre_list.append(transforms.Resize((self.config.max_side, self.config.max_side)))
         transform_pre_list.append(transforms.ToTensor()) # PIL to Tensor
-        # if self.config.standardize:
-        #     transform_pre_list.append(transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]))
-            # transform_post_list.append(transforms.Normalize(mean=[-0.485, -0.456, -0.406], std=[1, 1, 1]))
         if self.config.input_range != 1:
             transform_pre_list.append(transforms.Lambda(lambda x: x.mul_(self.config.input_range)))
             transform_post_list.append(transforms.Lambda(lambda x: x.mul_(1/self.config.input_range)))
@@ -107,66 +110,86 @@ class OptimzeBasePipeline(object):
 
         return transforms.Compose(transform_pre_list), transforms.Compose(transform_post_list)
     
-    def generate_expr_name(self, mask=False):
+    def generate_expr_name(self):
+        """save basic config to output folder name"""
         infos = []
         infos += [self.config.model_type]
+        infos += [self.config.layers.replace(' ', '').replace(',', '-')]
         infos += [self.config.optimizer]
-        infos += AorB(self.config.use_softmax_smoothing, 'softmax2D')
         infos += AorB(self.config.standardize, 'std', 'raw')
         infos += ['R' + str(self.config.input_range)]
-        infos += AorB(self.config.use_in, 'IN')
         infos += self.add_extra_infos()
-        infos += AorB(mask, 'mask')
 
         return '_'.join(infos)
     
     def add_extra_infos(self):
+        """save additional infomation to output folder name"""
         return []
     
     def generate_filename(self, content_path: str, style_path:str):
+        """save basic infomation to output filename"""
         infos = [get_basename(content_path), get_basename(style_path)]
-        infos += AorB(self.config.optimizer != 'lbfgs', str(self.config.lr))
         infos += self.add_extra_file_infos()
         return '_'.join(infos)
     
     def add_extra_file_infos(self):
+        """save additional infomation to output filename"""
         return []
     
-    def feat2embedding(self, feats):
+    ############################ Tools Start ##################################
+    def lerp(self, t_from, t_to, alpha):
+        return (1 - alpha) * t_from + alpha * t_to
+        
+    def tensor2pil(self, t: torch.Tensor):
+        return self.transform_post(t.detach().cpu().squeeze())
+
+    def feat2embedding(self, feats: torch.Tensor):
         return rearrange(feats, 'n c h w -> (h w) (n c)')
     
-    def inspect_features(self, feats, name):
-        LOGGER.debug('%s: mean=%.3e, var=%.3e, max=%.3e, min=%.3e', name, feats.detach().mean().item(), feats.detach().var().item(), feats.detach().max().item(), feats.detach().min().item())
+    def inspect_features(self, feats: torch.Tensor, tag: str):
+        LOGGER.debug('%s: mean=%.3e, var=%.3e, max=%.3e, min=%.3e', tag, feats.detach().mean().item(), feats.detach().var().item(), feats.detach().max().item(), feats.detach().min().item())
+    
+    def visualize_features(self, feats: torch.Tensor, tag: str):
+        for i, f in enumerate(feats, 1):
+            self.writer.add_images(tag, repeat(rearrange(f, 'n c h w -> c n h w'), 'n c h w -> n (m c) h w', m=3), global_step=i, dataformats='NCHW')
+    ############################ Tools End ####################################
        
-    def optimize_process(self, content_path, style_path, mask=False):
+    def optimize_process(self, content_path, style_path):
         raise NotImplementedError("you must implement this method in extended class")
 
-    def __call__(self, content_path: str, style_path: str, mask=False):
-        expr_name = self.generate_expr_name(mask=mask)
+    def __call__(self, content_path: str, style_path: str):
+        # set up folders which will save the output of algorithm and contain some necessary infomation.
+        expr_name = self.generate_expr_name()
         filename = self.generate_filename(content_path, style_path)
-        expr_dir = self.config.output_dir + '/' + expr_name
+        expr_dir = self.config.output_dir  + '/' + self.config.name + '/' + expr_name
         check_folder(expr_dir)
         LOGGER.info(f'Output: {expr_dir}')
         LOGGER.info(f'Filename: {filename}')
 
         self.time_record.reset_time()
 
-        optimize_images = self.optimize_process(content_path, style_path, mask)
+        #! Core of Algorithm
+        self.optimize_process(content_path, style_path)
 
+        # show excution time
         self.time_record.set_record_point('Optimization')
         self.time_record.show()
         
+        # save results
         if self.config.save_process:
-            images2gif(list(optimize_images.values()), expr_dir + f'/{filename}_process.gif')
+            images2gif(list(self.optimize_images.values()), expr_dir + f'/{filename}_process.gif')
 
-        if hasattr(self.config, 'max_scales') or self.config.verbose: # NNST
-            for k, img in optimize_images.items():
+        if self.config.verbose:
+            for k, img in self.optimize_images.items():
                 img.save(expr_dir + f'/{filename}_{k}.png')
 
-        if optimize_images.get('init', None) != None:
-            optimize_images['init'].save(expr_dir + f'/{filename}_init.png')
-        optimize_images['result'].save(expr_dir + f'/{filename}_result.png')
+        if self.config.save_init and self.optimize_images.get('init', None) != None:
+            self.optimize_images['init'].save(expr_dir + f'/{filename}_init.png')
 
+        if self.optimize_images.get('result', None) != None:  
+            self.optimize_images['result'].save(expr_dir + f'/{filename}_result.png')
+
+        # change config of wandb to save important infomation
         self.writer.update_cfg(Timecost=self.time_record.get_record_point('Optimization'))
 
 

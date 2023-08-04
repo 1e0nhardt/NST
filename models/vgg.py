@@ -1,16 +1,16 @@
 import math
-from einops import rearrange, repeat
+import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
+from einops import rearrange, repeat
 from PIL import Image
 from torchvision import models, transforms
-import sys
+
 sys.path.append('D:/MyCodes/NST')
 
 from utils_st import calc_mean_std
-from utils import ResizeMaxSide
 
 
 class VGG19FeatureExtractor(nn.Module):
@@ -80,7 +80,7 @@ class VGG16FeatureExtractor(nn.Module):
         self.model = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
         self.layers = layers
     
-    def forward(self, ix, hypercolumn=False, weight_factor=1, normalize=True):
+    def forward(self, ix, hypercolumn=False, weight_factor=1, normalize=False):
         x = ix.clone() # 标准化时不修改原output image的数值
         final_ix = max(self.layers)
         style_features = []
@@ -97,7 +97,7 @@ class VGG16FeatureExtractor(nn.Module):
             x = layer(x)
             if i in self.layers:
                 style_features.append(x)
-            
+
             if i == 20:
                 content_features = x.clone()
 
@@ -106,7 +106,7 @@ class VGG16FeatureExtractor(nn.Module):
         
         #! Normalize each layer by # channels so # of channels doesn't dominate 
         if normalize:
-            style_features = [f/math.pow(f.shape[1], weight_factor) for f in style_features]
+            style_features = [f / math.pow(f.shape[1], weight_factor) for f in style_features]
 
         if hypercolumn:
             # resize and concat
@@ -120,14 +120,26 @@ class VGG16FeatureExtractor(nn.Module):
 
 
 if __name__ == '__main__':
-    from rich.progress import track
     from rich.console import Console
+    from rich.progress import track
     CONSOLE = Console()
-    from torch.utils.tensorboard import SummaryWriter
     from inception import InceptionFeatureExtractor
+    from torch.utils.tensorboard import SummaryWriter
 
     vgg16 = VGG16FeatureExtractor(layers=[25,18,11,6,1], std=True).cuda()
     # vgg16 = InceptionFeatureExtractor().cuda()
+    vgg16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
+    # print(vgg16[:3])
+    for i, layer in enumerate(vgg16):
+        if 'MaxPool' in str(layer):
+            CONSOLE.print(i, '-->', str(layer))
+        else:
+            CONSOLE.print(i, str(layer))
+
+    # for i, layer in enumerate(vgg16.new_model):
+    #     CONSOLE.print(i, str(layer))
+
+    exit()
     writer = SummaryWriter('log/vgg16/features/c1s4adaintarget')
     image_c = Image.open('data/content/C1.png')
     # image = Image.open('data/style/130.jpg')
