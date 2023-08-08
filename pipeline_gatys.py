@@ -92,16 +92,18 @@ class GatysPipeline(OptimzeBasePipeline):
 
                 loss = 0
                 #! Gram loss
-                style_loss = gram_loss(s_feats, style_features)
+                # style_loss = gram_loss(s_feats, style_features)
                 # content_loss = torch.mean((c_feats - content_features) ** 2)
                 # total_variance_loss = tv_loss(opt_img)
-                loss = style_loss# + content_loss #+ 1 * total_variance_loss
+                # loss = style_loss# + content_loss #+ 1 * total_variance_loss
 
                 #! align mean and std
-                # for cur, style in zip(s_feats, style_features):
-                #     c_mean, c_std = calc_mean_std(cur)
-                #     s_mean, s_std = calc_mean_std(style)
-                #     loss += torch.mean((c_mean - s_mean)**2 + (c_std - s_std)**2) 
+                for cur, style in zip(s_feats, style_features):
+                    c_mean, c_std = calc_mean_std(cur)
+                    s_mean, s_std = calc_mean_std(style)
+                    # loss += torch.mean((c_mean - s_mean)**2) 
+                    # loss += torch.mean((c_std - s_std)**2) 
+                    loss += torch.mean((c_mean - s_mean)**2 + (c_std - s_std)**2) 
                 
                 #! kl loss | cross entropy loss
                 # for cur, style in zip(s_feats, style_features):
@@ -139,7 +141,7 @@ if __name__ == '__main__':
         # 'results/gatys/vgg19_lbfgs_std_R1_1_rgb__withcontentloss/sailboat_S4_result_S4_result.png', 
         # 'results/gatys/vgg19_lbfgs_std_R1_1_rgb_alignmeanstd_withcontentloss/sailboat_S4_result_S4_result_S4_result_S4_result.png', 
         # 'data/style/130.jpg',
-        'data/nnst_style/S4.jpg',
+        'data/nnst_style/S1.jpg',
         # 'data/nnst_style/circles.png',
     )
     

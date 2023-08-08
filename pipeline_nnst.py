@@ -257,10 +257,15 @@ if __name__ == '__main__':
     #             style_dir + s
     #         )
     # exit()
+    # pipeline(
+    #     # 'data/truck/14.png', 
+    #     'data/content/sailboat.jpg', 
+    #     # 'data/content/C2.png', 
+    #     # 'data/style/122.jpg',
+    #     'data/nnst_style/S4.jpg'
+    # )
+
     pipeline(
-        # 'data/truck/14.png', 
-        'data/content/sailboat.jpg', 
-        # 'data/content/C2.png', 
-        # 'data/style/122.jpg',
-        'data/nnst_style/S4.jpg'
+        'data/content/content_im.jpg', 
+        'data/content/style_im.jpg',
     )

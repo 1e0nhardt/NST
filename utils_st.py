@@ -1,13 +1,188 @@
 import gc
+import os
+import random
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange, repeat
+from PIL import Image
 from skimage.exposure import match_histograms
+from torchvision import transforms
 
 from utils import LOGGER
 
+###############################################################################
+######################### Segment Mask Tools ##################################
+###############################################################################
+def get_seg_dicts(cont_feats, styl_feats, cmask, smask):
+    """
+    B=1
+    :param cont_feat: List([N, cH1, cW1], ...)
+    :param styl_feat: List([N, sH1, sW1], ...)
+    :param cmask: [h, w]
+    :param smask: [h, w]
+    :return content_mask_dict, style_feat_dict
+    """
+    content_mask_dict = {}
+    style_feat_dict = {}
+
+    for content_feat, style_feat in zip(cont_feats, styl_feats):
+        B, N, cH, cW = content_feat.shape
+        _, _, sH, sW = style_feat.shape
+
+        offset_a = 0
+        offset_b = 0
+
+        # 如果特征图宽高太大，则进行稀疏采样
+        if max(cH, cW) > 128:
+            stride = max(cH, cW) // 128
+            content_feat = content_feat[:, :, offset_a::stride, offset_b::stride]
+            _, _, cH, cW = content_feat.shape
+        
+        if max(sH, sW) > 128:
+            stride = max(sH, sW) // 128
+            style_feat = style_feat[:, :, offset_a::stride, offset_b::stride]
+            #! center style features
+            style_feat = style_feat - style_feat.mean(2, keepdims=True)
+            _, _, sH, sW = style_feat.shape
+
+        # content_feat = content_feat.reshape(B, N, -1)[0]
+        style_feat = style_feat.reshape(B, N, -1)[0]
+
+        # 找有效的label set。
+        label_set, label_indicator = compute_label_info(cmask, smask)
+
+        # 将mask resize到当前特征图大小。 interpolate要求输入为四维或更高 (N,C,H,W)
+        resized_content_segment = F.interpolate(cmask[None, None, :, :], (cH, cW), mode='nearest').squeeze()
+        resized_style_segment = F.interpolate(smask[None, None, :, :], (sH, sW), mode='nearest').squeeze()
+
+        for label in label_set: # 逐标签处理
+            if not label_indicator[label]: # 判断标签是否可用
+                continue
+            
+            # 找到mask对应的索引
+            # 这种用法返回满足条件的元素的坐标位置。注意返回的是这样的元组:(indices,)
+            content_mask_index = torch.where(resized_content_segment.reshape(-1) == label)[0].to('cuda')
+            style_mask_index = torch.where(resized_style_segment.reshape(-1) == label)[0].to('cuda')
+            if content_mask_index is None or style_mask_index is None:
+                continue
+            
+            if content_mask_dict.get(label) is None:
+                content_mask_dict[label] = [content_mask_index]
+            else:
+                content_mask_dict[label].append(content_mask_index)
+            
+            # 根据索引找到mask对应的特征
+            masked_style_feat = torch.index_select(style_feat, 1, style_mask_index)
+            if style_feat_dict.get(label) is None:
+                style_feat_dict[label] = [masked_style_feat]
+            else:
+                style_feat_dict[label].append(masked_style_feat)
+            
+    return content_mask_dict, style_feat_dict
+
+def compute_label_info(cont_seg, styl_seg):
+    """
+    统计有多少有效label
+    :param cont_seg (h, w) 
+    :param styl_seg (h, w)
+    :return label_set, label_valid_indicator
+    """
+    if cont_seg.size is False or styl_seg.size is False:
+        return
+    max_label = torch.max(cont_seg) + 1
+    label_set = torch.unique(cont_seg)
+    label_indicator = torch.zeros(max_label)
+    for l in label_set:
+        # if l==0:
+        #   continue
+        is_valid = lambda a, b: a > 10 and b > 10 and a / b < 100 and b / a < 100 # 两个mask不能太小，两者之间像素数量差距也不要差100倍以上
+        o_cont_mask = torch.where(cont_seg.reshape(-1) == l)[0]
+        o_styl_mask = torch.where(styl_seg.reshape(-1) == l)[0]
+        label_indicator[l] = is_valid(o_cont_mask.numel(), o_styl_mask.numel())
+    # 索引类型为uint8会出现奇怪的行为 ==> 对一维数组索引，得到一个二维的数组。 
+    # tensor作索引会出现奇怪的行为
+    return [l.item() for l in label_set.long()], [l.item() for l in label_indicator.long()]
+
+def load_segment(image_path, size=None):
+    """
+    Transfer color labels to number labels
+    :param image_path
+    :param size (w, h)
+    :return tensor (h, w)
+    """
+    def change_seg(seg):
+        color_dict = {
+            (153, 45, 165): 3,  # blue
+            (45, 98, 166): 2,  # blue
+            (0, 0, 0): 0,  # black
+            (255, 255, 255): 1,  # white
+            (165, 45, 46): 4,  # red
+            (165, 139, 44): 5,  # yellow
+            (128, 128, 128): 6,  # grey
+            (0, 255, 255): 7,  # lightblue
+            (255, 0, 255): 8  # purple
+        }
+        # color_dict = {
+        #     (0, 0, 255): 3,  # blue
+        #     (0, 255, 0): 2,  # green
+        #     (0, 0, 0): 0,  # black
+        #     (255, 255, 255): 1,  # white
+        #     (255, 0, 0): 4,  # red
+        #     (255, 255, 0): 5,  # yellow
+        #     (128, 128, 128): 6,  # grey
+        #     (0, 255, 255): 7,  # lightblue
+        #     (255, 0, 255): 8  # purple
+        # }
+        arr_seg = np.array(seg) # (h, w, 3)
+        new_seg = np.zeros(arr_seg.shape[:-1]) # (h, w)
+        for x in range(arr_seg.shape[0]):
+            for y in range(arr_seg.shape[1]):
+                if tuple(arr_seg[x, y, :]) in color_dict:
+                    new_seg[x, y] = color_dict[tuple(arr_seg[x, y, :])]
+                else:
+                    min_dist_index = 0
+                    min_dist = 99999
+                    for key in color_dict:
+                        dist = np.sum(np.abs(np.asarray(key) - arr_seg[x, y, :]))
+                        if dist < min_dist:
+                            min_dist = dist
+                            min_dist_index = color_dict[key]
+                        elif dist == min_dist:
+                            try:
+                                min_dist_index = new_seg[x, y - 1, :]
+                            except Exception:
+                                pass
+                    new_seg[x, y] = min_dist_index
+        return new_seg.astype(np.uint8)
+
+    if not os.path.exists(image_path):
+        print("Can not find segment image path: %s " % image_path)
+        return None
+
+    image = Image.open(image_path).convert("RGB")
+
+    if size is not None:
+        image.resize(size, Image.NEAREST)
+
+    image = np.array(image)
+    # print(image.shape)
+    # vr, cr = np.unique(image.reshape(-1, 3), axis=0, return_counts=True)
+    # for v, c in zip(vr, cr):
+    #     if c > 500:
+    #         print(f'{v}: {c}')
+    image = change_seg(image)
+
+    # image *= 48
+    # Image.fromarray(image, 'L').save('loaded_seg.png')
+    # print(image.shape)
+    # print(torch.from_numpy(image).shape)
+    return torch.from_numpy(image)
+###############################################################################
+######################### Segment Mask Tools end ##############################
+###############################################################################
 
 #! EFDM
 def exact_feature_distribution_matching(content_feat, style_feat):
@@ -42,6 +217,8 @@ def calc_mean_std(feat, eps=1e-7):
     feat_mean = feat.reshape(N, C, -1).mean(dim=2).reshape(N, C, 1, 1)
     return feat_mean, feat_std
 
+def calc_covariance(feat, eps=1e-7):
+    return None
 
 #! AdaIN
 def adaptive_instance_normalization(content_feat, style_feat):
@@ -128,7 +305,22 @@ def wct(fc_fp32, fs_fp32):
     target = (fcs_hat + ms).reshape(b, c, hc, wc)
     return target.to(torch.float32)
 
+def covariance_loss(fc, fs):
+    b, c, _, _ = fc.shape
 
+    fc = fc.reshape(b, c, -1)
+    fs = fs.reshape(b, c, -1)
+
+    # center
+    fc = fc - fc.mean(2, keepdims=True)
+    fs = fs - fs.mean(2, keepdims=True)
+
+    # 计算协方差阵
+    cov_c = torch.bmm(fc, fc.transpose(1,2)).div(fc.shape[1]-1)
+    cov_s = torch.bmm(fs, fs.transpose(1,2)).div(fs.shape[1]-1)
+
+    return torch.mean((cov_c - cov_s)**2)
+ 
 def softmax_smoothing_2d(feats: torch.Tensor, T=1):
     _, _, h, w = feats.shape
     x = rearrange(feats, 'n c h w -> n c (h w)')
@@ -219,6 +411,8 @@ def cosine_dismat(A, B, center=False):
         A = A - A.mean(2, keepdims=True)
         B = B - B.mean(2, keepdims=True)
 
+    # LOGGER.debug(A.shape)
+    # LOGGER.debug(B.shape)
     # [B,HW] 计算逐像素点的每个通道像素值组成的向量的模。
     A_norm = torch.sqrt((A**2).sum(1)) 
     B_norm = torch.sqrt((B**2).sum(1))
@@ -293,6 +487,17 @@ def split_downsample(x, downsample_factor):
 
 
 if __name__ == '__main__':
+    # seg_path = 'data/content/style_guidance.jpg'
+    # style_mask = load_segment(seg_path)
+    # content_mask = load_segment('data/content/content_guidance.jpg')
+    exit()
+    x = torch.tensor([[1, 0, 2, 0, 3, 0], [1, 0, 2, 0, 3, 0]])
+    y = np.array([[1, 0, 2, 0, 3, 0], [1, 0, 2, 0, 3, 0]])
+
+    print(torch.where(x != 0))  # 输出：(tensor([0, 2, 4]),)
+    print(np.where(y != 0))  # 输出：(array([0, 2, 4]),)
+
+    exit()
     torch.manual_seed(42)
     x = torch.rand(1, 6, 256, dtype=torch.float32)
 

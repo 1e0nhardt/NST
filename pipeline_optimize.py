@@ -3,6 +3,8 @@ import typing
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from functools import wraps
+import cv2
+import numpy as np
 
 import torch
 from einops import rearrange, repeat
@@ -45,9 +47,11 @@ class OptimzeBaseConfig:
     """use ImageNet mean to standardization"""
     input_range: float = 1
     """scale number range. default 1."""
+    exact_resize: bool = False
+    """resize use exact size"""
     max_side: int = 512
     """max side length of resized image"""
-    exact_resize: tuple = (512, 512)
+    exact_size: tuple = (512, 512)
     """exact size of inputs"""
     use_tv_reg: bool = False
     """use total variance regularizer"""
@@ -95,10 +99,10 @@ class OptimzeBasePipeline(object):
         """prepare transforms for preprocess image and postprocess image"""
         transform_pre_list = []
         transform_post_list = []
-        if self.config.name == 'nnst':
+        if not self.config.exact_resize:
             transform_pre_list.append(ResizeMaxSide(self.config.max_side))
         else:
-            transform_pre_list.append(transforms.Resize((self.config.max_side, self.config.max_side)))
+            transform_pre_list.append(transforms.Resize(self.config.exact_size))
         transform_pre_list.append(transforms.ToTensor()) # PIL to Tensor
         if self.config.input_range != 1:
             transform_pre_list.append(transforms.Lambda(lambda x: x.mul_(self.config.input_range)))
@@ -152,6 +156,20 @@ class OptimzeBasePipeline(object):
     def visualize_features(self, feats: torch.Tensor, tag: str):
         for i, f in enumerate(feats, 1):
             self.writer.add_images(tag, repeat(rearrange(f, 'n c h w -> c n h w'), 'n c h w -> n (m c) h w', m=3), global_step=i, dataformats='NCHW')
+    
+    def get_lap_filtered_image(self, path):
+        # 读取图像
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        # 应用拉普拉斯变换
+        laplacian = cv2.Laplacian(img, cv2.CV_64F)
+        # 由于拉普拉斯变换可能会产生负值，所以将结果转换为绝对值，并转换为8位无符号整型
+        laplacian_abs = np.uint8(np.absolute(laplacian))
+        if self.config.exact_resize:
+            content_laplacian = transforms.Resize(self.config.exact_size)(transforms.ToTensor()(laplacian_abs))
+        else:
+            content_laplacian = ResizeMaxSide(self.config.max_side)(transforms.ToTensor()(laplacian_abs))
+        content_laplacian = repeat(content_laplacian, 'c h w -> (n c) h w', n=3).unsqueeze(0)
+        return content_laplacian.to(self.device)
     ############################ Tools End ####################################
        
     def optimize_process(self, content_path, style_path):

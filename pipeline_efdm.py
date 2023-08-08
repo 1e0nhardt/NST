@@ -27,11 +27,13 @@ class EFDMConfig(OptimzeBaseConfig):
     """feature extractor model type vgg16 | vgg19 | inception"""
     # layers: str = "1,6,11,20,29"
     # layers: str = "1"
+    # layers: str = "0,5,10,17,24"
     layers: str = "1,6,11,18,25"
     """layer indices of style features which should seperate by ','"""
     optimizer: str = 'lbfgs'
     """optimizer type: adam | lbfgs"""
     max_iter: int = 500
+    exact_resize: bool = True
 
 
 class EFDMPipeline(OptimzeBasePipeline):
@@ -41,7 +43,8 @@ class EFDMPipeline(OptimzeBasePipeline):
         check_folder(self.config.output_dir)
     
     def add_extra_infos(self):
-        infos += ['gramreg']
+        infos =[]
+        infos += ['relu']
         return infos
     
     def optimize_process(self, content_path, style_path):
@@ -94,9 +97,9 @@ class EFDMPipeline(OptimzeBasePipeline):
                     style_loss += torch.mean((input.view(B,C,-1)-value_style.gather(-1, inverse_index))**2)
 
                 # total_variance_loss = tv_loss(opt_img)
-                cov_loss = gram_loss(o_feats, style_features)
+                #cov_loss = gram_loss(o_feats, style_features)
 
-                loss = self.config.lambda_s * style_loss + cov_loss# + content_loss #+ 1 * total_variance_loss
+                loss = self.config.lambda_s * style_loss# + cov_loss# + content_loss #+ 1 * total_variance_loss
  
                 loss.backward()
 
@@ -138,6 +141,6 @@ if __name__ == '__main__':
 
     pipeline(
         'data/content/sailboat.jpg', 
-        'data/style/130.jpg',
+        'data/style/17.jpg',
         # 'data/nnst_style/shape.png',
     )

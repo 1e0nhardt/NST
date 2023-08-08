@@ -145,18 +145,18 @@ class ResizeHelper(object):
         return t[:, :, t_pad:h_new-b_pad, l_pad:w_new-r_pad]
 
 
-def showimg(ax, img, title=None, cmap='viridis'):
+def showimg(ax, img, title=None, cmap='viridis', opencv=False):
     if len(img.shape) == 2:
         cmap = 'gray'
     if type(img) is torch.Tensor:
-        img = tensor2img(img)
+        img = tensor2img(img, opencv=opencv)
     ax.imshow(img, cmap=cmap)
     if title is not None:
         ax.set_title(title)
     ax.axis('off')
 
 
-def showimgs(rows, cols, imgs, titles=None, cmap='viridis'):
+def showimgs(rows, cols, imgs, titles=None, cmap='viridis', opencv=False):
     dpi = mpl.rcParams['figure.dpi']
     figsize = (400/dpi*cols, 400/dpi*rows)
     fig, axes = plt.subplots(rows, cols, figsize=figsize)
@@ -167,7 +167,7 @@ def showimgs(rows, cols, imgs, titles=None, cmap='viridis'):
     if titles is None:
         titles = [None] * len(imgs)
     for ax, img, title in zip(axes, imgs, titles):
-        showimg(ax, img, title, cmap)
+        showimg(ax, img, title, cmap, opencv=opencv)
     plt.show()
 
 
