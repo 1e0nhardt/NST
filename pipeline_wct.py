@@ -37,8 +37,6 @@ class WCTConfig(OptimzeBaseConfig):
 class WCTPipeline(OptimzeBasePipeline):
     def __init__(self, config: WCTConfig) -> None:
         super().__init__(config)
-        self.config = config
-        check_folder(self.config.output_dir)
     
     def add_extra_infos(self):
         return AorB(self.config.use_tv_loss, 'tvloss') + ['pyr']
@@ -46,29 +44,23 @@ class WCTPipeline(OptimzeBasePipeline):
     def add_extra_file_infos(self):
         return [self.config.layers] + ['sinit']
     
-    def optimize_process(self, content_path, style_path):
-        # prepare input tensors: (1, c, h, w), (1, c, h, w)
-        content_image = self.transform_pre(Image.open(content_path)).unsqueeze(0).to(self.device)
-        # convert("RGB")会让灰度图像也变为3通道
-        style_image = self.transform_pre(Image.open(style_path).convert("RGB")).unsqueeze(0).to(self.device)
-
-        # style_image = (content_image.clone() + style_image.clone())/2
-        # opt_img = style_image.data.clone()
-        # opt_img = content_image.data.clone()
-        # opt_img = torch.rand_like(content_image)
+    def common_optimize_process(self, Ic, Is):
+        # Is = (Ic.clone() + Is.clone())/2
+        # opt_img = Is.data.clone()
+        # opt_img = Ic.data.clone()
+        # opt_img = torch.rand_like(Ic)
         # opt_img = opt_img.to(self.device)
 
-        output_pyramid = dec_lap_pyr(content_image.clone(), 8)
+        output_pyramid = dec_lap_pyr(Ic.clone(), 8)
 
         # save init image
-        # out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-        # optimize_images['init'] = out_img
+        self.save_image(syn_lap_pyr(output_pyramid), 'init', verbose=True)
 
         # opt_img.requires_grad = True
 
         # get target features
-        _, style_features = self.model.forward(style_image)
-        content_features, fs = self.model.forward(content_image)
+        _, style_features = self.model.forward(Is)
+        content_features, fs = self.model.forward(Ic)
 
         target_features = []
 
@@ -78,27 +70,19 @@ class WCTPipeline(OptimzeBasePipeline):
         # style_features = fs
 
         opt_vars = [torch.nn.Parameter(level_image) for level_image in output_pyramid]
-
-        if self.config.optimizer == 'lbfgs':
-            optimizer = optim.LBFGS(opt_vars, lr=0.1)
-            # optimizer = optim.LBFGS([opt_img], lr=1)
-        elif self.config.optimizer == 'adam':
-            optimizer = optim.Adam([opt_img], lr=self.config.lr)
-        else: 
-            raise RuntimeError(f'{self.config.optimizer} is not supported')
+        optimizer = optim.LBFGS(opt_vars, lr=1)
 
         n_iter = [0]
-
         while n_iter[0] <= self.config.max_iter:
             def closure():
+                loss = 0
                 optimizer.zero_grad()
                 opt_img = syn_lap_pyr(opt_vars)
+
                 c_feats, s_feats = self.model(opt_img)
 
                 # content_loss = torch.mean((c_feats - content_features) ** 2)
-                loss = 0
                 
-
                 # target_features = []
                 # for c, s in zip(s_feats, style_features):
                 #     target_features.append(wct(c, s))
@@ -123,15 +107,14 @@ class WCTPipeline(OptimzeBasePipeline):
                 #print loss
                 if n_iter[0] % self.config.show_iter == 0:
                     print(f'Iteration: {n_iter[0]}, loss: {loss.item():.4f}')
-                    out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-                    self.optimize_images[str(n_iter[0]//self.config.show_iter)] = out_img
+                    self.save_image(opt_img, str(n_iter[0]//self.config.show_iter), verbose=True)
                 return loss
             
             optimizer.step(closure)
         
         # save final image
         opt_img = syn_lap_pyr(opt_vars)
-        self.optimize_images['result'] = self.tensor2pil(opt_img)
+        self.save_image(opt_img, 'result')
 
     
 if __name__ == '__main__':

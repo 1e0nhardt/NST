@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from functools import wraps
 import cv2
 import numpy as np
+from PIL import Image
 
 import torch
 from einops import rearrange, repeat
@@ -15,7 +16,7 @@ from torchvision import transforms
 import wandb
 from models.inception import InceptionFeatureExtractor
 from models.vgg import VGG16FeatureExtractor, VGG19FeatureExtractor
-from utils import (LOGGER, AorB, ResizeMaxSide, TimeRecorder, check_folder,
+from utils import (LOGGER, AorB, ResizeHelper, ResizeMaxSide, TimeRecorder, check_folder,
                    get_basename, images2gif, str2list)
 
 install(show_locals=False) # 设置rich为默认的异常输出处理程序
@@ -35,6 +36,17 @@ class OptimzeBaseConfig:
     """optimize steps"""
     show_iter: int = 50
     """frequencies to show current loss"""
+    save_init: bool = False
+    """save init image"""
+    save_process_gif: bool = False
+    """save images of optimize process as gif"""
+    verbose: bool = False
+    """show additional information"""
+    use_wandb: bool = False
+    """use wandb"""
+    use_tensorboard: bool = False
+    """use tensorboard"""
+
     model_type: str = 'vgg16'
     """feature extractor model type vgg16 | vgg19 | inception. Generally, vgg16 is enough."""
     layers: str = "1,6,11,18,25"
@@ -43,28 +55,20 @@ class OptimzeBaseConfig:
     """optimizer type: adam | lbfgs"""
     lr: float = 1e-3
     """learning rate"""
+    optimize_strategy: str = 'common'
+    """common: optimize rgb parameters, default; pyramid: optimize laplacian pyramid; cascade: optimze rgb but from coarse to fine"""
     standardize: bool = True
     """use ImageNet mean to standardization"""
     input_range: float = 1
     """scale number range. default 1."""
-    exact_resize: bool = False
-    """resize use exact size"""
     max_side: int = 512
     """max side length of resized image"""
+    exact_resize: bool = False
+    """resize use exact size"""
     exact_size: tuple = (512, 512)
     """exact size of inputs"""
     use_tv_reg: bool = False
     """use total variance regularizer"""
-    save_init: bool = False
-    """save init image"""
-    save_process: bool = False
-    """save images of optimize process as gif"""
-    verbose: bool = False
-    """show additional information"""
-    use_wandb: bool = False
-    """use wandb"""
-    use_tensorboard: bool = False
-    """use tensorboard"""
 
 
 class OptimzeBasePipeline(object):
@@ -83,6 +87,7 @@ class OptimzeBasePipeline(object):
         self.time_record = TimeRecorder(self.config.output_dir.split('/')[-1])
         self.writer = ExprWriter(config, self.generate_expr_name())
         self.optimize_images = OrderedDict()
+        self.verbose_keys = []
     
     def prepare_model(self) -> typing.Union[VGG16FeatureExtractor, VGG19FeatureExtractor, InceptionFeatureExtractor]:
         if self.config.model_type == 'vgg19':
@@ -102,7 +107,7 @@ class OptimzeBasePipeline(object):
         if not self.config.exact_resize:
             transform_pre_list.append(ResizeMaxSide(self.config.max_side))
         else:
-            transform_pre_list.append(transforms.Resize(self.config.exact_size))
+            transform_pre_list.append(transforms.Resize(self.config.exact_size, antialias=True))
         transform_pre_list.append(transforms.ToTensor()) # PIL to Tensor
         if self.config.input_range != 1:
             transform_pre_list.append(transforms.Lambda(lambda x: x.mul_(self.config.input_range)))
@@ -117,11 +122,12 @@ class OptimzeBasePipeline(object):
     def generate_expr_name(self):
         """save basic config to output folder name"""
         infos = []
-        infos += [self.config.model_type]
-        infos += [self.config.layers.replace(' ', '').replace(',', '-')]
-        infos += [self.config.optimizer]
-        infos += AorB(self.config.standardize, 'std', 'raw')
-        infos += ['R' + str(self.config.input_range)]
+        infos += [self.config.optimize_strategy]
+        # infos += [self.config.model_type]
+        # infos += [self.config.layers.replace(' ', '').replace(',', '-')]
+        # infos += [self.config.optimizer]
+        # infos += AorB(self.config.standardize, 'std', 'raw')
+        # infos += ['R' + str(self.config.input_range)]
         infos += self.add_extra_infos()
 
         return '_'.join(infos)
@@ -146,6 +152,15 @@ class OptimzeBasePipeline(object):
         
     def tensor2pil(self, t: torch.Tensor):
         return self.transform_post(t.detach().cpu().squeeze())
+    
+    def save_image(self, t: torch.Tensor, key: str, verbose=False):
+        """
+        save tensor as image to self.optimize_images dict.\n
+        if verbose=False, always save.\n
+        if verbose=True, save when self.config.verbose is True.
+        """
+        if not verbose or self.config.verbose:
+            self.optimize_images[key] = self.tensor2pil(t)
 
     def feat2embedding(self, feats: torch.Tensor):
         return rearrange(feats, 'n c h w -> (h w) (n c)')
@@ -165,18 +180,24 @@ class OptimzeBasePipeline(object):
         # 由于拉普拉斯变换可能会产生负值，所以将结果转换为绝对值，并转换为8位无符号整型
         laplacian_abs = np.uint8(np.absolute(laplacian))
         if self.config.exact_resize:
-            content_laplacian = transforms.Resize(self.config.exact_size)(transforms.ToTensor()(laplacian_abs))
+            content_laplacian = transforms.Resize(self.config.exact_size, antialias=True)(transforms.ToTensor()(laplacian_abs))
         else:
             content_laplacian = ResizeMaxSide(self.config.max_side)(transforms.ToTensor()(laplacian_abs))
         content_laplacian = repeat(content_laplacian, 'c h w -> (n c) h w', n=3).unsqueeze(0)
         return content_laplacian.to(self.device)
     ############################ Tools End ####################################
        
-    def optimize_process(self, content_path, style_path):
-        raise NotImplementedError("you must implement this method in extended class")
+    def common_optimize_process(self, Ic, Is):
+        raise NotImplementedError("you should implement this method in extended class")
+
+    def pyramid_optimize_process(self, Ic, Is):
+        raise NotImplementedError("you should implement this method in extended class")
+
+    def cascade_optimize_process(self, Ic, Is):
+        raise NotImplementedError("you should implement this method in extended class")
 
     def __call__(self, content_path: str, style_path: str):
-        # set up folders which will save the output of algorithm and contain some necessary infomation.
+        #! set up folders which will save the output of algorithm and contain some necessary infomation.
         expr_name = self.generate_expr_name()
         filename = self.generate_filename(content_path, style_path)
         expr_dir = self.config.output_dir  + '/' + self.config.name + '/' + expr_name
@@ -185,27 +206,37 @@ class OptimzeBasePipeline(object):
         LOGGER.info(f'Filename: {filename}')
 
         self.time_record.reset_time()
+        
+        #! read inputs and preprocess
+        # prepare input tensors: (1, c, h, w), (1, c, h, w)
+        content_image = self.transform_pre(Image.open(content_path)).unsqueeze(0).to(self.device)
+        # convert("RGB") make gray image also 3 channels
+        style_image = self.transform_pre(Image.open(style_path).convert("RGB")).unsqueeze(0).to(self.device)
+        self.content_path = content_path #* 当前拉普拉斯预处理要用。以后应该删除。
+
+        resize_helper = ResizeHelper()
+        content_image = resize_helper.resize_to8x(content_image)
+        style_image = resize_helper.resize_to8x(style_image)
 
         #! Core of Algorithm
-        self.optimize_process(content_path, style_path)
+        if self.config.optimize_strategy == 'common':
+            self.common_optimize_process(content_image, style_image)
+        elif self.config.optimize_strategy == 'pyramid':
+            self.pyramid_optimize_process(content_image, style_image)
+        elif self.config.optimize_strategy == 'cascade':
+            self.cascade_optimize_process(content_image, style_image)
+        else:
+            raise NotImplementedError('TODO')
 
-        # show excution time
+        #! show and save results
         self.time_record.set_record_point('Optimization')
         self.time_record.show()
         
-        # save results
-        if self.config.save_process:
+        if self.config.save_process_gif:
             images2gif(list(self.optimize_images.values()), expr_dir + f'/{filename}_process.gif')
 
-        if self.config.verbose:
-            for k, img in self.optimize_images.items():
-                img.save(expr_dir + f'/{filename}_{k}.png')
-
-        if self.config.save_init and self.optimize_images.get('init', None) != None:
-            self.optimize_images['init'].save(expr_dir + f'/{filename}_init.png')
-
-        if self.optimize_images.get('result', None) != None:  
-            self.optimize_images['result'].save(expr_dir + f'/{filename}_result.png')
+        for k, img in self.optimize_images.items():
+            img.save(expr_dir + f'/{filename}_{k}.png')
 
         # change config of wandb to save important infomation
         self.writer.update_cfg(Timecost=self.time_record.get_record_point('Optimization'))

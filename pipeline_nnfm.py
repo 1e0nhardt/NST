@@ -36,8 +36,6 @@ class NNFMConfig(OptimzeBaseConfig):
 class NNFMPipeline(OptimzeBasePipeline):
     def __init__(self, config: NNFMConfig) -> None:
         super().__init__(config)
-        self.config = config
-        check_folder(self.config.output_dir)
         self.kl_loss = nn.KLDivLoss()
 
     def add_extra_file_infos(self):
@@ -46,56 +44,46 @@ class NNFMPipeline(OptimzeBasePipeline):
     def add_extra_infos(self):
         return AorB(self.config.use_remd_loss, 'remd') + ['noise']# + ['mask']
     
-    def optimize_process(self, content_path, style_path):
-        # prepare input tensors: (1, c, h, w), (1, c, h, w)
-        content_image = self.transform_pre(Image.open(content_path)).unsqueeze(0).to(self.device)
-        # convert("RGB")会让灰度图像也变为3通道
-        style_image = self.transform_pre(Image.open(style_path).convert("RGB")).unsqueeze(0).to(self.device)
-        resize_helper = ResizeHelper()
-        content_image = resize_helper.resize_to8x(content_image)
-        style_image = resize_helper.resize_to8x(style_image)
-
-        # style_image = self.lerp(content_image, style_image, 0.2)
-
+    def common_optimize_process(self, Ic, Is):
         # init
-        # opt_img = content_image.data.clone()
-        # opt_img = self.lerp(opt_img, style_image.clone(), 0.1)
-        # opt_img = (1-alpha)*opt_img + alpha*style_image.data.clone()
-        # opt_img[:,:,-150:,-150:] = (opt_img[:,:,-150:,-150:] + style_image.data.clone()[:,:,-150:,-150:])/2
-        # opt_img = torch.rand_like(content_image)
-        content_laplacian = self.get_lap_filtered_image(content_path)
+        # opt_img = Ic.data.clone()
+        # opt_img = self.lerp(opt_img, Is.clone(), 0.1)
+        # opt_img = (1-alpha)*opt_img + alpha*Is.data.clone()
+        # opt_img[:,:,-150:,-150:] = (opt_img[:,:,-150:,-150:] + Is.data.clone()[:,:,-150:,-150:])/2
+        # opt_img = torch.rand_like(Ic)
+        content_laplacian = self.get_lap_filtered_image(self.content_path)
         LOGGER.debug(content_laplacian.shape)
         # opt_img = content_laplacian + torch.rand_like(content_laplacian) * 0.2
-        # opt_img = self.lerp(content_laplacian, torch.rand_like(content_image), 0)
-        opt_img = self.lerp(torch.ones_like(content_image), torch.rand_like(content_image), 1)
+        # opt_img = self.lerp(content_laplacian, torch.rand_like(Ic), 0)
+        opt_img = self.lerp(torch.ones_like(Ic), torch.rand_like(Ic), 1)
 
         opt_img = opt_img.to(self.device)
 
         # save init image
-        self.optimize_images['init'] = self.tensor2pil(opt_img)
+        self.save_image(opt_img, 'init')
 
         opt_img.requires_grad = True
         optimizer = optim.Adam([opt_img], lr=self.config.lr)
 
         # get target features
-        _, style_features = self.model.forward(style_image, hypercolumn=self.config.method == 'HM', normalize=False)
-        _, content_features = self.model.forward(content_image, hypercolumn=self.config.method == 'HM', normalize=False)
+        _, Is_features = self.model(Is, hypercolumn=self.config.method == 'HM', normalize=False)
+        _, Ic_features = self.model(Ic, hypercolumn=self.config.method == 'HM', normalize=False)
 
         #! mask
         # style_mask = load_segment('data/content/style_guidance.jpg')
         # content_mask = load_segment('data/content/content_guidance.jpg')
 
-        # c_indices_dict, s_feats_dict = get_seg_dicts(content_features, style_features, content_mask, style_mask)
+        # c_indices_dict, s_feats_dict = get_seg_dicts(Ic_features, Is_features, content_mask, style_mask)
 
         if self.config.method == 'HM':
-            target_feats = feat_replace(content_features, style_features)
+            target_feats = feat_replace(Ic_features, Is_features)
 
         for i in range(self.config.max_iter):
+            loss = 0
             optimizer.zero_grad()
 
-            loss = 0
             if self.config.method == 'HM':
-                _, x_features = self.model.forward(opt_img, hypercolumn=True, normalize=False)
+                _, x_features = self.model(opt_img, hypercolumn=True, normalize=False)
 
                 # calc losses
                 nn_loss = cos_loss(x_features, target_feats)
@@ -105,29 +93,29 @@ class NNFMPipeline(OptimzeBasePipeline):
                 # loss += 1e-3 * self.kl_loss(x_feats, target_feats)
 
             elif self.config.method == 'FS':
-                _, cur_feats = self.model(opt_img, weight_factor=self.config.weight_factor, normalize=False)
+                _, Io_features = self.model(opt_img, weight_factor=self.config.weight_factor, normalize=False)
 
-                # loss += gram_loss(cur_feats, style_features)
+                # loss += gram_loss(Io_features, Is_features)
 
                 ################################################
                 ############### Try use Mask ###################
                 ################################################
 
                 # # 如果特征图宽高太大，则进行稀疏采样
-                # for i in range(len(cur_feats)):
-                #     if max(cur_feats[i].size(2), cur_feats[i].size(3)) > 128:
-                #         stride = max(cur_feats[i].size(2), cur_feats[i].size(3)) // 128
-                #         cur_feats[i] = cur_feats[i][:, :, 0::stride, 0::stride]
-                #         cur_feats[i] = cur_feats[i].reshape(cur_feats[i].size(0), cur_feats[i].size(1), -1)[0] # (c, hw)
+                # for i in range(len(Io_features)):
+                #     if max(Io_features[i].size(2), Io_features[i].size(3)) > 128:
+                #         stride = max(Io_features[i].size(2), Io_features[i].size(3)) // 128
+                #         Io_features[i] = Io_features[i][:, :, 0::stride, 0::stride]
+                #         Io_features[i] = Io_features[i].reshape(Io_features[i].size(0), Io_features[i].size(1), -1)[0] # (c, hw)
                 #     else:
-                #         cur_feats[i] = cur_feats[i].reshape(cur_feats[i].size(0), cur_feats[i].size(1), -1)[0]
+                #         Io_features[i] = Io_features[i].reshape(Io_features[i].size(0), Io_features[i].size(1), -1)[0]
                     
                 #     #! center output features
-                #     cur_feats[i] = cur_feats[i] - cur_feats[i].mean(1, keepdims=True)
+                #     Io_features[i] = Io_features[i] - Io_features[i].mean(1, keepdims=True)
 
                 # # 每个label的每一层的特征分别找最近邻并计算cosine距离
                 # for label in c_indices_dict.keys():
-                #     for i, (cur, masked_style_feats) in enumerate(zip(cur_feats, s_feats_dict[label])):
+                #     for i, (cur, masked_style_feats) in enumerate(zip(Io_features, s_feats_dict[label])):
                 #         masked_content_feats = torch.index_select(cur, 1, c_indices_dict[label][i])
                 #         if self.config.use_remd_loss:
                 #             loss += calc_remd_loss(masked_style_feats.unsqueeze(0), masked_content_feats.unsqueeze(0), center=False)
@@ -138,9 +126,7 @@ class NNFMPipeline(OptimzeBasePipeline):
                 ############# Try use Mask  End ################
                 ################################################
 
-                for cur, style in zip(cur_feats, style_features):
-                    LOGGER.debug(cur.mean(1))
-                    LOGGER.debug(style.mean(1))
+                for cur, style in zip(Io_features, Is_features):
                     # 如果特征图宽高太大，则进行稀疏采样
                     if max(cur.size(2), cur.size(3)) > 64:
                         stride = max(cur.size(2), cur.size(3)) // 64
@@ -183,12 +169,11 @@ class NNFMPipeline(OptimzeBasePipeline):
             if i % self.config.show_iter == self.config.show_iter - 1:
                 LOGGER.info(f'Iteration: {i+1}, loss: {loss.item():.4f}')
                 # LOGGER.info(f'Iteration: {i+1}, loss: {loss.item():.4f}, tv_loss: {total_variance_loss.item():.1e}')
-                self.optimize_images[f'iter_{i}'] = self.tensor2pil(opt_img)
+                self.save_image(opt_img, f'iter_{i}', verbose=True)
 
         # save results
-        out_img = self.tensor2pil(opt_img)
-        self.optimize_images['result'] = out_img
-        self.writer.log_image('result', out_img)
+        self.save_image(opt_img, 'result')
+        self.writer.log_image('result', self.tensor2pil(opt_img))
 
 
 if __name__ == '__main__':

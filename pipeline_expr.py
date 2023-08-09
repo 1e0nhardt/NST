@@ -36,8 +36,6 @@ class ExprConfig(OptimzeBaseConfig):
 class ExprPipeline(OptimzeBasePipeline):
     def __init__(self, config: ExprConfig) -> None:
         super().__init__(config)
-        self.config = config
-        check_folder(self.config.output_dir)
     
     def add_extra_infos(self):
         return [f'reverse_content'] + AorB(self.config.use_tv_reg, '10tvloss') + ['adaintarget']
@@ -45,79 +43,68 @@ class ExprPipeline(OptimzeBasePipeline):
     def add_extra_file_infos(self):
         return ['cont-lap']
     
-    def optimize_process(self, content_path, style_path):
-        # prepare input tensors: (1, c, h, w), (1, c, h, w)
-        content_image = self.transform_pre(Image.open(content_path)).unsqueeze(0).to(self.device)
-        # convert("RGB") makes grayscale image also has 3 channels.
-        style_image = self.transform_pre(Image.open(style_path).convert("RGB")).unsqueeze(0).to(self.device)
-
-        # style_image = (content_image.clone() + style_image.clone())/2
-        opt_img = content_image.data.clone()
-        # opt_img = style_image.data.clone()
-        # opt_img = torch.rand_like(content_image)
+    def common_optimize_process(self, Ic, Is):
+        opt_img = Ic.data.clone()
+        # opt_img = Is.data.clone()
+        # opt_img = torch.rand_like(Ic)
         opt_img = opt_img.to(self.device)
 
-        # output_pyramid = dec_lap_pyr(content_image.clone(), 8)
+        # output_pyramid = dec_lap_pyr(Ic.clone(), 8)
 
         # save init image
-        self.optimize_images['init'] = self.tensor2pil(opt_img)
+        self.save_image(opt_img, 'init')
 
         opt_img.requires_grad = True
 
         # get target features
-        _, style_features = self.model(style_image)
-        content_features, fs = self.model(content_image)
+        _, Is_features = self.model(Is)
+        Ic_41, Ic_features = self.model(Ic)
 
-        _, laplacian_features = self.model(self.get_lap_filtered_image(content_path))
+        _, laplacian_features = self.model(self.get_lap_filtered_image(self.content_path))
 
-        # style_features = fs
+        # Is_features = Ic_features
 
         # get target features
-        # target_features = [exact_feature_distribution_matching(fs[i], style_features[i]) for i in range(len(style_features)-1)] # efdm
+        # target_features = [exact_feature_distribution_matching(Ic_features[i], Is_features[i]) for i in range(len(Is_features)-1)] # efdm
         target_features = []
-        for cur, lap in zip(fs, laplacian_features):
+        for cur, lap in zip(Ic_features, laplacian_features):
             target_features.append(cur - lap)
 
-        # for cur, style in zip(fs, style_features):
+        # for cur, style in zip(Ic_features, Is_features):
         #     c_mean, c_std = calc_mean_std(cur)
         #     s_mean, s_std = calc_mean_std(style)
         #     LOGGER.debug(f'c_mean={c_mean}, c_std={c_std}, s_mean={s_mean}, s_std={s_std}')
         #     target_features.append(((cur - c_mean)/c_std) * s_std + s_mean)
                     
-        # target_features = [f + torch.ones_like(f) for f in fs]
-        # target_features = [f + f/2 * torch.rand_like(f) for f in fs]
+        # target_features = [f + torch.ones_like(f) for f in Ic_features]
+        # target_features = [f + f/2 * torch.rand_like(f) for f in Ic_features]
 
 
         #! 特征插值
-        # for i in range(len(style_features)):
-        #     style_features[i] = (style_features[i] + fs[i])/2
+        # for i in range(len(Is_features)):
+        #     Is_features[i] = (Is_features[i] + Ic_features[i])/2
 
         # optimize
         # opt_vars = [torch.nn.Parameter(level_image) for level_image in output_pyramid]
 
-        if self.config.optimizer == 'lbfgs':
-            # optimizer = optim.LBFGS(opt_vars, lr=0.1)
-            optimizer = optim.LBFGS([opt_img], lr=1)
-        elif self.config.optimizer == 'adam':
-            optimizer = optim.Adam([opt_img], lr=self.config.lr)
-        else: 
-            raise RuntimeError(f'{self.config.optimizer} is not supported')
+        # optimizer = optim.LBFGS(opt_vars, lr=0.1)
+        optimizer = optim.LBFGS([opt_img], lr=1)
 
         n_iter = [0]
-
         while n_iter[0] <= self.config.max_iter:
             def closure():
-                optimizer.zero_grad()
-                # opt_img = syn_lap_pyr(opt_vars)
-                c_feats, o_feats = self.model(opt_img)
-
-                # content_loss = torch.mean((c_feats - content_features) ** 2)
                 loss = 0
+                optimizer.zero_grad()
+
+                # opt_img = syn_lap_pyr(opt_vars)
+                Io_41, Io_feats = self.model(opt_img)
+
+                # content_loss = torch.mean((Io_41 - content_features) ** 2)
                 
                 total_variance_loss = tv_loss(opt_img)
 
-                # for cur, style in zip(s_feats, style_features):
-                for cur, style in zip(o_feats, target_features):
+                # for cur, style in zip(s_feats, Is_features):
+                for cur, style in zip(Io_feats, target_features):
                     loss += torch.mean((cur - style) ** 2)
                     # 交叉熵
                     # style = softmax_smoothing_2d(torch.sigmoid(style))
@@ -135,15 +122,14 @@ class ExprPipeline(OptimzeBasePipeline):
                 #print loss
                 if n_iter[0] % self.config.show_iter == 0:
                     LOGGER.info(f'Iteration: {n_iter[0]}, loss: {loss.item():.4f}')
-                    out_img = self.transform_post(opt_img.detach().cpu().squeeze())
-                    self.optimize_images[str(n_iter[0]//self.config.show_iter)] = out_img
+                    self.save_image(opt_img, str(n_iter[0]//self.config.show_iter), verbose=True)
                 return loss
             
             optimizer.step(closure)
         
         # save final image
         # opt_img = syn_lap_pyr(opt_vars)
-        self.optimize_images['result'] = self.tensor2pil(opt_img)
+        self.save_image(opt_img, 'result')
         
     
 if __name__ == '__main__':

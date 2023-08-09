@@ -62,22 +62,14 @@ class NNSTPipeline(OptimzeBasePipeline):
     def add_extra_infos(self):
         return AorB(self.config.use_remd_loss, 'remd')
     
-    def optimize_process(self, content_path, style_path):
-        # 将输入张量准备好: (1, c, h, w), (1, c, h, w)
-        content_image = self.transform_pre(Image.open(content_path)).unsqueeze(0).to(self.device)
-        # convert("RGB")会让灰度图像也变为3通道
-        style_image = self.transform_pre(Image.open(style_path).convert("RGB")).unsqueeze(0).to(self.device)
-        # 日志
-        resize_helper = ResizeHelper()
-        content_image = resize_helper.resize_to8x(content_image)
-        style_image = resize_helper.resize_to8x(style_image)
-        self.writer.log_image('content', self.transform_post(content_image.squeeze().cpu()))
-        self.writer.log_image('reference', self.transform_post(style_image.squeeze().cpu()))
+    def common_optimize_process(self, Ic, Is):
+        self.writer.log_image('content', self.tensor2pil(Ic))
+        self.writer.log_image('reference', self.tensor2pil(Is))
 
         # 构建图像金字塔
-        style_pyramid = dec_lap_pyr(style_image, self.config.pyramid_levels)
-        content_pyramid = dec_lap_pyr(content_image, self.config.pyramid_levels)
-        output_pyramid = dec_lap_pyr(content_image.clone(), self.config.pyramid_levels)
+        style_pyramid = dec_lap_pyr(Is, self.config.pyramid_levels)
+        content_pyramid = dec_lap_pyr(Ic, self.config.pyramid_levels)
+        output_pyramid = dec_lap_pyr(Ic.clone(), self.config.pyramid_levels)
 
         # LOGGER.debug('=================Pyramid shape=====================')
         # for x in output_pyramid:
@@ -127,42 +119,30 @@ class NNSTPipeline(OptimzeBasePipeline):
 
                 # 日志
                 LOGGER.info(f'Target Features: {target_feats.shape}')
-                for i, f in enumerate(style_hypercolumns, 1):
-                    f=f.unsqueeze(0)
-                    self.writer.add_images('style feat_image', repeat(rearrange(f, 'n c h w -> c n h w'), 'n c h w -> n (m c) h w', m=3), global_step=i, dataformats='NCHW')
-                for i, f in enumerate(target_feats, 1):
-                    f=f.unsqueeze(0)
-                    self.writer.add_images('target feat image', repeat(rearrange(f, 'n c h w -> c n h w'), 'n c h w -> n (m c) h w', m=3), global_step=i, dataformats='NCHW')
 
             with torch.no_grad(): # 保存初始图像
                 if scale == self.config.max_scales - 1 and False:
-                    self.optimize_images[f'HM_init'] = syn_lap_pyr(output_pyramid)
-                    self.writer.log_image(f'HM_init', self.transform_post(syn_lap_pyr(output_pyramid).squeeze()))
+                    output_image_tensor = syn_lap_pyr(output_pyramid)
+                    self.save_image(output_image_tensor, f'HM_init', verbose=True)
+                    self.writer.log_image(f'HM_init', self.tensor2pil(output_image_tensor))
 
             #! 在当前分辨率下用Hypercolumn Matching优化输出图像
             self.optimize_output(output_pyramid, target_feats, scale, matting_laplacian=matting_laplacian)
 
             with torch.no_grad(): # 保存中间优化结果
                 if scale == 0:
-                    self.optimize_images[f'HM_{scale}'] = syn_lap_pyr(output_pyramid)
-                    self.writer.log_image(f'HM_{scale}', self.transform_post(syn_lap_pyr(output_pyramid).squeeze()))
+                    output_image_tensor = syn_lap_pyr(output_pyramid)
+                    self.save_image(output_image_tensor, f'HM_{scale}', verbose=True)
+                    self.writer.log_image(f'HM_{scale}', self.tensor2pil(output_image_tensor))
 
         #! 在最高分辨率下用Feature Split优化输出图像
         LOGGER.info(f'Final Stage: FS')
-        self.optimize_output(output_pyramid, None, scale, style_image, final_pass=True, matting_laplacian=matting_laplacian)
+        self.optimize_output(output_pyramid, None, scale, Is, final_pass=True, matting_laplacian=matting_laplacian)
 
         with torch.no_grad(): # 保存最终输出
-            self.optimize_images[f'result'] = syn_lap_pyr(output_pyramid)
-            self.writer.add_image(f'result_img', torch.clamp(syn_lap_pyr(output_pyramid).squeeze(), 0, 1))
-            self.writer.log_image('result', self.transform_post(syn_lap_pyr(output_pyramid).squeeze()))
-        
-        # 日志
-        for k, v in self.optimize_images.items():
-            for i in range(3):
-                self.writer.add_histogram(k, v.detach()[0][i].reshape(-1))
-            self.inspect_features(v, k)
-            self.optimize_images[k] = self.tensor2pil(v)
-        
+            output_image_tensor = syn_lap_pyr(output_pyramid)
+            self.save_image(output_image_tensor, 'result')
+            self.writer.log_image('result', self.tensor2pil(output_image_tensor))
     
     def optimize_output(self, output_pyramid, target_feats, scale, style_image=None, final_pass=False, matting_laplacian=None):
         # 将当前尺度下的图像金字塔设为优化对象
@@ -257,15 +237,15 @@ if __name__ == '__main__':
     #             style_dir + s
     #         )
     # exit()
-    # pipeline(
-    #     # 'data/truck/14.png', 
-    #     'data/content/sailboat.jpg', 
-    #     # 'data/content/C2.png', 
-    #     # 'data/style/122.jpg',
-    #     'data/nnst_style/S4.jpg'
-    # )
-
     pipeline(
-        'data/content/content_im.jpg', 
-        'data/content/style_im.jpg',
+        # 'data/truck/14.png', 
+        'data/content/sailboat.jpg', 
+        # 'data/content/C2.png', 
+        # 'data/style/122.jpg',
+        'data/nnst_style/S1.jpg'
     )
+
+    # pipeline(
+    #     'data/content/content_im.jpg', 
+    #     'data/content/style_im.jpg',
+    # )

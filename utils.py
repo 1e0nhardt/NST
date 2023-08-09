@@ -73,7 +73,7 @@ def str2list(s: str):
 ###############################################################################
 
 class ResizeMaxSide(torch.nn.Module):
-    def __init__(self, size, interpolation=InterpolationMode.BILINEAR,antialias="True"):
+    def __init__(self, size, interpolation=InterpolationMode.BILINEAR, antialias="True"):
         super().__init__()
         
         if not isinstance(size, (int, Sequence)):
