@@ -28,6 +28,6 @@ python pipeline_main.py --content_path xx --style_path xx
 
 ## Acknowledgement
 - [PAMA](https://github.com/luoxuan-cs/PAMA)
-- [STROTSS]()
-- [NNST]()
-- [ARF]()
+- [STROTSS](https://github.com/nkolkin13/STROTSS)
+- [NNST](https://github.com/nkolkin13/NeuralNeighborStyleTransfer)
+- [ARF](https://github.com/Kai-46/ARF-svox2)
