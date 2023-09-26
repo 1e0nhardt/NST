@@ -202,7 +202,7 @@ def histogram_matching(content_feat, style_feat):
     x_view = content_feat.view(-1, W,H)
     image1_temp = match_histograms(np.array(x_view.detach().clone().cpu().float().transpose(0, 2)),
                                    np.array(style_feat.view(-1, W, H).detach().clone().cpu().float().transpose(0, 2)),
-                                   multichannel=True)
+                                   channel_axis=0)
     image1_temp = torch.from_numpy(image1_temp).float().to(content_feat.device).transpose(0, 2).view(B, C, W, H)
     return content_feat + (image1_temp - content_feat).detach()
 
@@ -216,9 +216,6 @@ def calc_mean_std(feat, eps=1e-7):
     feat_std = feat_var.sqrt().reshape(N, C, 1, 1)
     feat_mean = feat.reshape(N, C, -1).mean(dim=2).reshape(N, C, 1, 1)
     return feat_mean, feat_std
-
-def calc_covariance(feat, eps=1e-7):
-    return None
 
 #! AdaIN
 def adaptive_instance_normalization(content_feat, style_feat):
@@ -305,7 +302,80 @@ def wct(fc_fp32, fs_fp32):
     target = (fcs_hat + ms).reshape(b, c, hc, wc)
     return target.to(torch.float32)
 
-def covariance_loss(fc, fs):
+###############################################################################
+###################################cWCT########################################
+###############################################################################
+def cholesky_dec(conv, invert=False):
+        cholesky = torch.linalg.cholesky if torch.__version__ >= '1.8.0' else torch.cholesky
+        try:
+            L = cholesky(conv)
+        except RuntimeError:
+            # print("Warning: Cholesky Decomposition fails")
+            iden = torch.eye(conv.shape[-1]).to(conv.device)
+            eps = 1e-8
+            while True:
+                try:
+                    conv = conv + iden * eps
+                    L = cholesky(conv)
+                    break
+                except RuntimeError:
+                    eps = eps+1e-8
+
+        if invert:
+            L = torch.inverse(L)
+
+        return L.to(conv.dtype)
+
+def whitening(x):
+    mean = torch.mean(x, -1)
+    mean = mean.unsqueeze(-1).expand_as(x)
+    x = x - mean
+
+    conv = (x @ x.transpose(-1, -2)).div(x.shape[-1] - 1)
+    inv_L = cholesky_dec(conv, invert=True)
+
+    whiten_x = inv_L @ x
+
+    return whiten_x
+
+def coloring(whiten_xc, xs):
+    xs_mean = torch.mean(xs, -1)
+    xs = xs - xs_mean.unsqueeze(-1).expand_as(xs)
+
+    conv = (xs @ xs.transpose(-1, -2)).div(xs.shape[-1] - 1)
+    Ls = cholesky_dec(conv, invert=False)
+
+    coloring_cs = Ls @ whiten_xc
+    coloring_cs = coloring_cs + xs_mean.unsqueeze(-1).expand_as(coloring_cs)
+
+    return coloring_cs
+
+def cWCT(cont_feat, styl_feat):
+        """
+        :param cont_feat: [B, N, cH, cW]
+        :param styl_feat: [B, N, sH, sW]
+        :return color_fea: [B, N, cH, cW]
+        """
+        B, N, cH, cW = cont_feat.shape
+        cont_feat = cont_feat.reshape(B, N, -1)
+        styl_feat = styl_feat.reshape(B, N, -1)
+
+        in_dtype = cont_feat.dtype
+        cont_feat = cont_feat.double()
+        styl_feat = styl_feat.double()
+
+        # whitening and coloring transforms
+        whiten_fea = whitening(cont_feat)
+        color_fea = coloring(whiten_fea, styl_feat)
+
+        color_fea = color_fea.to(in_dtype)
+
+        return color_fea.reshape(B, N, cH, cW)
+###############################################################################
+###############################################################################
+###############################################################################
+
+def covariance_loss(fc, fs, normalize=False):
     b, c, _, _ = fc.shape
 
     fc = fc.reshape(b, c, -1)
@@ -315,12 +385,19 @@ def covariance_loss(fc, fs):
     fc = fc - fc.mean(2, keepdims=True)
     fs = fs - fs.mean(2, keepdims=True)
 
+    if normalize: # 结构保存的很好，风格迁移大多失败
+        fc_norm = ((fc * fc).sum(1, keepdims=True) + 1e-8).sqrt()
+        fs_norm = ((fs * fs).sum(1, keepdims=True) + 1e-8).sqrt()
+
+        fc = fc / (fc_norm + 1e-8)
+        fs = fs / (fs_norm + 1e-8)
+
     # 计算协方差阵
-    cov_c = torch.bmm(fc, fc.transpose(1,2)).div(fc.shape[1]-1)
-    cov_s = torch.bmm(fs, fs.transpose(1,2)).div(fs.shape[1]-1)
+    cov_c = torch.bmm(fc, fc.transpose(1,2)).div(fc.shape[1])
+    cov_s = torch.bmm(fs, fs.transpose(1,2)).div(fs.shape[1])
 
     return torch.mean((cov_c - cov_s)**2)
- 
+
 def softmax_smoothing_2d(feats: torch.Tensor, T=1):
     _, _, h, w = feats.shape
     x = rearrange(feats, 'n c h w -> n c (h w)')
@@ -459,6 +536,20 @@ def calc_remd_loss(A, B, center=True, l2=False):
     return remd
 
 
+def calc_ss_loss(A, B):
+    # A,B: [BCHW]
+    MA = cosine_dismat(A, A)
+    MB = cosine_dismat(B, B)
+    # Lself_similarity = torch.abs(MA-MB).mean() # Lss=1/HW sum{cosine-similarity-matirx}
+    Lself_similarity = torch.mean((MA-MB)**2) # Lss=1/HW sum{cosine-similarity-matirx}
+    ##################################测试用###########################################
+    # print_gpu_mem()
+    # recorder.save_record('peak_mem_alloc', torch.cuda.memory_allocated() / 1024**2)
+    # recorder.save_record('dmat_mem_alloc', calc_mem_allocated(MA) * 3)
+    ##################################测试用###########################################
+    return Lself_similarity
+
+
 def l2_dismat(A, B):
     """
     A: (1, 1, h, w)
@@ -474,6 +565,28 @@ def l2_dismat(A, B):
     return (A - B).unsqueeze(0) ** 2
 
 
+def st_target(A, B):
+    A = A.reshape(A.shape[0], A.shape[1], -1)
+    B = B.reshape(B.shape[0], B.shape[1], -1)
+
+    A = A - A.mean(2, keepdims=True)
+    B = B - B.mean(2, keepdims=True)
+
+    # # [B,HW] 计算逐像素点的每个通道像素值组成的向量的模。
+    # A_norm = torch.sqrt((A**2).sum(1)) 
+    # B_norm = torch.sqrt((B**2).sum(1))
+
+    # # 计算cosine-similarity前标准化
+    # A = (A/A_norm.unsqueeze(dim=1).expand(A.shape)).permute(0,2,1) 
+    # B = (B/B_norm.unsqueeze(dim=1).expand(B.shape))
+
+    # HW,C mul C,HW 逐点计算(每个像素点位置所有通道的像素值构成一个向量)cos距离
+    crossattn = torch.bmm(B, B.transpose(1, 2)) #! 显存占用大户
+    selfattn = torch.bmm(A, A.transpose(1, 2))
+    fo = torch.bmm(A.transpose(1, 2), selfattn)
+    return torch.mean((fo - torch.bmm(A.transpose(1, 2), crossattn)) ** 2)
+
+
 def split_downsample(x, downsample_factor):
     """
     x: (NCHW) | (CHW)\n
@@ -486,66 +599,213 @@ def split_downsample(x, downsample_factor):
     return outputs
 
 
-if __name__ == '__main__':
-    # seg_path = 'data/content/style_guidance.jpg'
-    # style_mask = load_segment(seg_path)
-    # content_mask = load_segment('data/content/content_guidance.jpg')
-    exit()
-    x = torch.tensor([[1, 0, 2, 0, 3, 0], [1, 0, 2, 0, 3, 0]])
-    y = np.array([[1, 0, 2, 0, 3, 0], [1, 0, 2, 0, 3, 0]])
+"""
+Copyright 2021 Mahmoud Afifi.
+ Mahmoud Afifi, Marcus A. Brubaker, and Michael S. Brown. "HistoGAN: 
+ Controlling Colors of GAN-Generated and Real Images via Color Histograms." 
+ In CVPR, 2021.
 
-    print(torch.where(x != 0))  # 输出：(tensor([0, 2, 4]),)
-    print(np.where(y != 0))  # 输出：(array([0, 2, 4]),)
+ @inproceedings{afifi2021histogan,
+  title={Histo{GAN}: Controlling Colors of {GAN}-Generated and Real Images via 
+  Color Histograms},
+  author={Afifi, Mahmoud and Brubaker, Marcus A. and Brown, Michael S.},
+  booktitle={CVPR},
+  year={2021}
+}
+"""
 
-    exit()
-    torch.manual_seed(42)
-    x = torch.rand(1, 6, 256, dtype=torch.float32)
+EPS = 1e-6
 
-    # AA^T定实对称矩阵。一定可以被正交对角化。
-    co_u, co_d, co_v_T = torch.linalg.svd(torch.bmm(x, x.transpose(1,2)))
-    c_u, c_d, c_v_T = torch.linalg.svd(x)
-    print(co_d)
-    print(co_u.shape)
-    print(co_d.shape)
-    print(co_v_T.shape)
-    print(co_d ** 2)
+class RGBuvHistBlock(nn.Module):
+  def __init__(self, h=64, insz=150, resizing='interpolation',
+               method='inverse-quadratic', sigma=0.02, intensity_scale=True,
+               device='cuda'):
+    """ Computes the RGB-uv histogram feature of a given image.
+    Args:
+      h: histogram dimension size (scalar). The default value is 64.
+      insz: maximum size of the input image; if it is larger than this size, the 
+        image will be resized (scalar). Default value is 150 (i.e., 150 x 150 
+        pixels).
+      resizing: resizing method if applicable. Options are: 'interpolation' or 
+        'sampling'. Default is 'interpolation'.
+      method: the method used to count the number of pixels for each bin in the 
+        histogram feature. Options are: 'thresholding', 'RBF' (radial basis 
+        function), or 'inverse-quadratic'. Default value is 'inverse-quadratic'.
+      sigma: if the method value is 'RBF' or 'inverse-quadratic', then this is 
+        the sigma parameter of the kernel function. The default value is 0.02.
+      intensity_scale: boolean variable to use the intensity scale (I_y in 
+        Equation 2). Default value is True.
 
-    print(co_u)
-    print(co_v_T)
-    # print(torch.allclose(abs(co_u), abs(c_u), atol=1e-7))
-    # print(co_u)
-    # print(c_u)
-    # print(torch.isclose(c_u, co_u))
-    # print(torch.bmm(c_u, c_u.transpose(1,2)))
-    # c_u[0, :, 4] *=-1
-    # print(torch.bmm(c_u, co_v_T))
-    exit()
+    Methods:
+      forward: accepts input image and returns its histogram feature. Note that 
+        unless the method is 'thresholding', this is a differentiable function 
+        and can be easily integrated with the loss function. As mentioned in the
+         paper, the 'inverse-quadratic' was found more stable than 'RBF' in our 
+         training.
+    """
+    super(RGBuvHistBlock, self).__init__()
+    self.h = h
+    self.insz = insz
+    self.device = device
+    self.resizing = resizing
+    self.method = method
+    self.intensity_scale = intensity_scale
+    if self.method == 'thresholding':
+      self.eps = 6.0 / h
+    else:
+      self.sigma = sigma
 
-    ret = [0, 0, 0]
-    for i in range(1000):
-        x = torch.rand(1, 6, 9, dtype=torch.float32)
+  def forward(self, x):
+    x = torch.clamp(x, 0, 1)
+    if x.shape[2] > self.insz or x.shape[3] > self.insz:
+      if self.resizing == 'interpolation':
+        x_sampled = F.interpolate(x, size=(self.insz, self.insz),
+                                  mode='bilinear', align_corners=False)
+      elif self.resizing == 'sampling':
+        inds_1 = torch.LongTensor(
+          np.linspace(0, x.shape[2], self.h, endpoint=False)).to(
+          device=self.device)
+        inds_2 = torch.LongTensor(
+          np.linspace(0, x.shape[3], self.h, endpoint=False)).to(
+          device=self.device)
+        x_sampled = x.index_select(2, inds_1)
+        x_sampled = x_sampled.index_select(3, inds_2)
+      else:
+        raise Exception(
+          f'Wrong resizing method. It should be: interpolation or sampling. '
+          f'But the given value is {self.resizing}.')
+    else:
+      x_sampled = x
 
-        # AA^T定实对称矩阵。一定可以被正交对角化。
-        c_u, c_d, c_v_T = torch.linalg.svd(torch.bmm(x, x.transpose(1,2)))
-        # print(c_u)
-        # print(c_v_T)
-        if torch.allclose(c_u, c_v_T.transpose(1,2), atol=1e-8): # False
-            ret[0] += 1
-        if torch.allclose(c_u, c_v_T.transpose(1,2), atol=1e-7): # True
-            ret[1] += 1
-        if torch.allclose(c_u, c_v_T.transpose(1,2), atol=1e-6): # True
-            ret[2] += 1
-        # print(torch.bmm(c_u, c_v_T)) # 并不是单位阵，由于数值原因，有约1e-7左右的误差。
-    print(ret)
-    exit()
+    L = x_sampled.shape[0]  # size of mini-batch
+    if x_sampled.shape[1] > 3:
+      x_sampled = x_sampled[:, :3, :, :]
+    X = torch.unbind(x_sampled, dim=0)
+    hists = torch.zeros((x_sampled.shape[0], 3, self.h, self.h)).to(
+      device=self.device)
+    for l in range(L):
+      I = torch.t(torch.reshape(X[l], (3, -1)))
+      II = torch.pow(I, 2)
+      if self.intensity_scale:
+        Iy = torch.unsqueeze(torch.sqrt(II[:, 0] + II[:, 1] + II[:, 2] + EPS), 
+                             dim=1)
+      else:
+        Iy = 1
 
-    # 默认some=True，返回简化的奇异值分解。 返回U S V
-    ret1 = torch.svd(x, some=False) 
-    # full_matrices = not some，默认为True。返回U S V^H
-    ret2 = torch.linalg.svd(x, full_matrices=True)
-    print(ret1[0] == ret2[0])
-    print(ret1[1] == ret2[1])
-    print(ret1[2] == ret2[2].transpose(1, 2))
+      Iu0 = torch.unsqueeze(torch.log(I[:, 0] + EPS) - torch.log(I[:, 1] + EPS),
+                            dim=1)
+      Iv0 = torch.unsqueeze(torch.log(I[:, 0] + EPS) - torch.log(I[:, 2] + EPS),
+                            dim=1)
+      diff_u0 = abs(
+        Iu0 - torch.unsqueeze(torch.tensor(np.linspace(-3, 3, num=self.h)),
+                              dim=0).to(self.device))
+      diff_v0 = abs(
+        Iv0 - torch.unsqueeze(torch.tensor(np.linspace(-3, 3, num=self.h)),
+                              dim=0).to(self.device))
+      if self.method == 'thresholding':
+        diff_u0 = torch.reshape(diff_u0, (-1, self.h)) <= self.eps / 2
+        diff_v0 = torch.reshape(diff_v0, (-1, self.h)) <= self.eps / 2
+      elif self.method == 'RBF':
+        diff_u0 = torch.pow(torch.reshape(diff_u0, (-1, self.h)),
+                            2) / self.sigma ** 2
+        diff_v0 = torch.pow(torch.reshape(diff_v0, (-1, self.h)),
+                            2) / self.sigma ** 2
+        diff_u0 = torch.exp(-diff_u0)  # Radial basis function
+        diff_v0 = torch.exp(-diff_v0)
+      elif self.method == 'inverse-quadratic':
+        diff_u0 = torch.pow(torch.reshape(diff_u0, (-1, self.h)),
+                            2) / self.sigma ** 2
+        diff_v0 = torch.pow(torch.reshape(diff_v0, (-1, self.h)),
+                            2) / self.sigma ** 2
+        diff_u0 = 1 / (1 + diff_u0)  # Inverse quadratic
+        diff_v0 = 1 / (1 + diff_v0)
+      else:
+        raise Exception(
+          f'Wrong kernel method. It should be either thresholding, RBF,' 
+          f' inverse-quadratic. But the given value is {self.method}.')
+      diff_u0 = diff_u0.type(torch.float32)
+      diff_v0 = diff_v0.type(torch.float32)
+      a = torch.t(Iy * diff_u0)
+      hists[l, 0, :, :] = torch.mm(a, diff_v0)
 
-    print(torch.eye(4))
+      Iu1 = torch.unsqueeze(torch.log(I[:, 1] + EPS) - torch.log(I[:, 0] + EPS),
+                            dim=1)
+      Iv1 = torch.unsqueeze(torch.log(I[:, 1] + EPS) - torch.log(I[:, 2] + EPS),
+                            dim=1)
+      diff_u1 = abs(
+        Iu1 - torch.unsqueeze(torch.tensor(np.linspace(-3, 3, num=self.h)),
+                              dim=0).to(self.device))
+      diff_v1 = abs(
+        Iv1 - torch.unsqueeze(torch.tensor(np.linspace(-3, 3, num=self.h)),
+                              dim=0).to(self.device))
+
+      if self.method == 'thresholding':
+        diff_u1 = torch.reshape(diff_u1, (-1, self.h)) <= self.eps / 2
+        diff_v1 = torch.reshape(diff_v1, (-1, self.h)) <= self.eps / 2
+      elif self.method == 'RBF':
+        diff_u1 = torch.pow(torch.reshape(diff_u1, (-1, self.h)),
+                            2) / self.sigma ** 2
+        diff_v1 = torch.pow(torch.reshape(diff_v1, (-1, self.h)),
+                            2) / self.sigma ** 2
+        diff_u1 = torch.exp(-diff_u1)  # Gaussian
+        diff_v1 = torch.exp(-diff_v1)
+      elif self.method == 'inverse-quadratic':
+        diff_u1 = torch.pow(torch.reshape(diff_u1, (-1, self.h)),
+                            2) / self.sigma ** 2
+        diff_v1 = torch.pow(torch.reshape(diff_v1, (-1, self.h)),
+                            2) / self.sigma ** 2
+        diff_u1 = 1 / (1 + diff_u1)  # Inverse quadratic
+        diff_v1 = 1 / (1 + diff_v1)
+
+      diff_u1 = diff_u1.type(torch.float32)
+      diff_v1 = diff_v1.type(torch.float32)
+      a = torch.t(Iy * diff_u1)
+      hists[l, 1, :, :] = torch.mm(a, diff_v1)
+
+      Iu2 = torch.unsqueeze(torch.log(I[:, 2] + EPS) - torch.log(I[:, 0] + EPS),
+                            dim=1)
+      Iv2 = torch.unsqueeze(torch.log(I[:, 2] + EPS) - torch.log(I[:, 1] + EPS),
+                            dim=1)
+      diff_u2 = abs(
+        Iu2 - torch.unsqueeze(torch.tensor(np.linspace(-3, 3, num=self.h)),
+                              dim=0).to(self.device))
+      diff_v2 = abs(
+        Iv2 - torch.unsqueeze(torch.tensor(np.linspace(-3, 3, num=self.h)),
+                              dim=0).to(self.device))
+      if self.method == 'thresholding':
+        diff_u2 = torch.reshape(diff_u2, (-1, self.h)) <= self.eps / 2
+        diff_v2 = torch.reshape(diff_v2, (-1, self.h)) <= self.eps / 2
+      elif self.method == 'RBF':
+        diff_u2 = torch.pow(torch.reshape(diff_u2, (-1, self.h)),
+                            2) / self.sigma ** 2
+        diff_v2 = torch.pow(torch.reshape(diff_v2, (-1, self.h)),
+                            2) / self.sigma ** 2
+        diff_u2 = torch.exp(-diff_u2)  # Gaussian
+        diff_v2 = torch.exp(-diff_v2)
+      elif self.method == 'inverse-quadratic':
+        diff_u2 = torch.pow(torch.reshape(diff_u2, (-1, self.h)),
+                            2) / self.sigma ** 2
+        diff_v2 = torch.pow(torch.reshape(diff_v2, (-1, self.h)),
+                            2) / self.sigma ** 2
+        diff_u2 = 1 / (1 + diff_u2)  # Inverse quadratic
+        diff_v2 = 1 / (1 + diff_v2)
+      diff_u2 = diff_u2.type(torch.float32)
+      diff_v2 = diff_v2.type(torch.float32)
+      a = torch.t(Iy * diff_u2)
+      hists[l, 2, :, :] = torch.mm(a, diff_v2)
+
+    # normalization
+    hists_normalized = hists / (
+        ((hists.sum(dim=1)).sum(dim=1)).sum(dim=1).view(-1, 1, 1, 1) + EPS)
+
+    return hists_normalized
+  
+def calc_histogram_loss(A, B, histogram_block):
+    input_hist = histogram_block(A) # [4, 3, 256, 256]
+    target_hist = histogram_block(B)
+    histogram_loss = (1/np.sqrt(2.0) * (torch.sqrt(torch.sum(
+        torch.pow(torch.sqrt(target_hist) - torch.sqrt(input_hist), 2)))) / 
+        input_hist.shape[0])
+
+    return histogram_loss
 

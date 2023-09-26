@@ -75,7 +75,7 @@ class RemdLoss(Function):
         grad_A = torch.zeros_like(A, device=A.device) # (1, hw, c)
         grad_B = torch.zeros_like(B, device=B.device) # (1, c, hw)
         #! 串行导致计算速度慢。可能并不是。
-        #! 可能是矩阵元素远大于cuda可以并行的线程数量，导致需要GPU执行的波数变多，此外访存操作也同样变多。性能瓶颈可能在这。
+        #! 可能是矩阵元素远大于cuda可以并行的线程数量，导致需要GPU执行的波数变多，此外访存操作也同样变多。
         #! 实际就是矩阵规模O(hw^2)增长的问题。
         for i, j in mins_index:
             grad_A[0, i] += B[0, :, j]
@@ -300,15 +300,3 @@ def calc_moment_loss(A, B):
 
 def calc_mse_loss(A, B):
     return nn.MSELoss(A, B)
-
-
-if __name__ == '__main__':
-    from torchvision import models
-    vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT).eval()
-    print(vgg)
-    x = torch.rand([1, 3, 512, 512])
-    print(vgg.features[:4](x).shape)
-    print(vgg.features[:9](x).shape)
-    print(vgg.features[:16](x).shape)
-    print(vgg.features[:23](x).shape)
-    print(vgg.features[:30](x).shape)

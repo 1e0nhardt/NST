@@ -1,3 +1,4 @@
+from collections import OrderedDict
 import inspect
 import itertools
 import logging
@@ -15,6 +16,8 @@ from PIL import Image
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.table import Table
+
+from sklearn.cluster import AgglomerativeClustering
 from torchvision.transforms.functional import (InterpolationMode,
                                                _interpolation_modes_from_int,
                                                get_dimensions, resize)
@@ -145,20 +148,22 @@ class ResizeHelper(object):
         return t[:, :, t_pad:h_new-b_pad, l_pad:w_new-r_pad]
 
 
-def showimg(ax, img, title=None, cmap='viridis', opencv=False):
-    if len(img.shape) == 2:
-        cmap = 'gray'
+def showimg(ax, img, title=None, cmap='turbo', opencv=False):
+    # if len(img.shape) == 2:
+    #     cmap = 'gray'
     if type(img) is torch.Tensor:
         img = tensor2img(img, opencv=opencv)
+    elif opencv:
+        img = img[..., ::-1]
     ax.imshow(img, cmap=cmap)
     if title is not None:
         ax.set_title(title)
     ax.axis('off')
 
 
-def showimgs(rows, cols, imgs, titles=None, cmap='viridis', opencv=False):
+def showimgs(rows, cols, imgs, titles=None, cmap='turbo', opencv=False):
     dpi = mpl.rcParams['figure.dpi']
-    figsize = (400/dpi*cols, 400/dpi*rows)
+    figsize = (200/dpi*cols, 200/dpi*rows)
     fig, axes = plt.subplots(rows, cols, figsize=figsize)
     try:
         axes = axes.reshape(-1)
@@ -298,18 +303,28 @@ class TimeRecorder(object):
 
     def __init__(self, title="Time Record") -> None:
         self._title = title
-        self._record = {}
+        self._record = OrderedDict()
         self._start = time.time()
     
     def reset_time(self):
         self._start = time.time()
+        self._record.clear()
     
     def set_record_point(self, key: str):
         now = time.time()
         if key in self._record.keys():
             CONSOLE.print(f'The key is already in use and will overwrite the previous content ==> {key}')
-        self._record[key] = now - self._start
+        self._record[key] = f'{now - self._start:.2f}'
         self._start = now
+    
+    def set_record(self, key, val):
+        self._record[key] = val
+    
+    def get_record(self, key):
+        if key in self._record.keys():
+            return self._record[key]
+        else:
+            return 'Null'
     
     def get_record_point(self, key: str):
         if key not in self._record.keys():
@@ -320,10 +335,25 @@ class TimeRecorder(object):
     def show(self):
         table = Table(title=self._title)
         table.add_column('Key', style='cyan')
-        table.add_column('Time cost', style='magenta')
+        table.add_column('Value', style='magenta')
         for k, v in self._record.items():
             table.add_row(k, str(v))
         CONSOLE.print(table)
+    
+    def save(self, dir, filename):
+        if os.path.exists(os.path.join(dir, 'metrics.csv')):
+            with open(os.path.join(dir, 'metrics.csv') , 'a') as f:
+                vals = list(self._record.values())
+                vals.insert(0, filename)
+                f.write(','.join(vals) + '\n')
+        else:
+            with open(os.path.join(dir, 'metrics.csv') , 'a') as f:
+                keys = list(self._record.keys())
+                keys.insert(0, 'Metrics')
+                vals = list(self._record.values())
+                vals.insert(0, filename)
+                f.write(','.join(keys) + '\n')
+                f.write(','.join(vals) + '\n')
 
 
 class Recorder(object):
@@ -381,6 +411,17 @@ def generate_perlin_noise_2d(shape, res):
     n1 = n01*(1-t[:,:,0]) + t[:,:,0]*n11
     return np.sqrt(2)*((1-t[:,:,1])*n0 + t[:,:,1]*n1)
 
+
+def hierarchy_cluster(data, n_clusters=3, metric='cosine', linkage='complete'):
+    # 定义模型并指定要形成的聚类数，例如3
+    cluster = AgglomerativeClustering(n_clusters=n_clusters, metric=metric, linkage=linkage)
+    return cluster.fit_predict(data)
+
+def cluster_features(features, n_cluster=3):
+    b, c, h, w = features.shape
+    data = features.reshape(c, -1).detach().cpu().numpy()
+    data_label = hierarchy_cluster(data)
+    return torch.from_numpy(data_label).to(features.device)
 
 if __name__ == '__main__':
     # r = Recorder()

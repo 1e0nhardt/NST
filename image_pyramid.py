@@ -1,7 +1,7 @@
 import torch.nn.functional as F
-from utils import LOGGER
+from utils_st import get_gaussian_conv
 
-def dec_lap_pyr(x, levs):
+def dec_lap_pyr(x, levs, apply_filter=False):
     """ constructs batch of 'levs' level laplacian pyramids from x
         Inputs:
             x -- BxCxHxW pytorch tensor
@@ -12,11 +12,15 @@ def dec_lap_pyr(x, levs):
     """
     pyr = []
     cur = x  # Initialize approx. coefficients with original image
+    gaussina_conv = get_gaussian_conv(3, 1, 1)
+    gaussina_conv.to(x.device)
 
     for i in range(levs):
         # Construct and store detail coefficients from current approx. coefficients
         h = cur.size(2)
         w = cur.size(3)
+        if apply_filter:
+            cur = gaussina_conv(cur)
         x_small = F.interpolate(cur, (h // 2, w // 2), mode='bilinear')
         x_back = F.interpolate(x_small, (h, w), mode='bilinear')
         lap = cur - x_back
@@ -59,10 +63,11 @@ if __name__ == '__main__':
     from PIL import Image
     from torchvision import transforms
 
-    img = Image.open('data/content/cornell.jpg')
+    # img = Image.open('data/contents/1.png')
+    img = Image.open('data/styles/1.jpg')
 
     preprocess = transforms.Compose([
-        transforms.Resize(1, max_size=512),
+        transforms.Resize((512, 512)),
         transforms.ToTensor(),
     ])
 
@@ -77,14 +82,18 @@ if __name__ == '__main__':
     h, w = img_lap[0].shape[2:]
     for i, x in enumerate(img_lap):
         print(x.shape)
-        out = postprocess(F.interpolate(x, size=(h, w), mode='bilinear').squeeze())
-        out.save(f'results/image_pyramid/lap_c_{i}.png')
+        out = postprocess(x.squeeze())
+        # out = postprocess(F.interpolate(x, size=(h, w), mode='bilinear').squeeze())
+        out.save(f'results/image_pyramid/lap_s1_{i}.png')
+
+        img_restore = syn_lap_pyr(img_lap[-(i+1):])
+        img_r = postprocess(img_restore.squeeze())
+        # img_r = postprocess(F.interpolate(img_restore, size=(h, w), mode='bilinear').squeeze())
+        img_r.save(f'results/image_pyramid/lap_r1_{8-i}.png')
 
     img_restore = syn_lap_pyr(img_lap)
-
     img_r = postprocess(img_restore.squeeze())
-
-    img_r.save('results/image_pyramid/lap_c1.png')
+    img_r.save('results/image_pyramid/lap_s1.png')
 
 
 

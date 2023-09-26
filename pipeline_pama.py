@@ -1,18 +1,20 @@
-from dataclasses import dataclass
-import torch
-from pama.pama_model import PAMANet
-from utils import ResizeHelper
-from PIL import Image
-from torchvision.transforms import transforms
-from utils import tensor2img, showimgs, save_image
 import os
+from dataclasses import dataclass
+
+import torch
+from PIL import Image
+from rich.progress import track
+from torchvision.transforms import transforms
+
+from pama.pama_model import PAMANet
+from utils import ResizeHelper, get_basename, save_image
 
 
 @dataclass
 class PamaConfig:
     """Pama Model Arguments"""
 
-    checkpoints: str = "D:/MyCodes/nerfstudio/pretrained/pama/original"
+    checkpoints: str = "data/pretrained/pama/original"
     """pretrained model path. Include encoder.pth, decoder.pth, and 3 PAMA*.pth"""
     pretrained: bool = True
     """use pretrained model"""
@@ -41,22 +43,13 @@ def pama_infer_one_image(Ic, Is, hparams):
 
 
 if __name__ == '__main__':
-    from torchvision.utils import make_grid
-    from torchvision.io import read_image
-    from pathlib import PurePath
     import tyro
 
     pama_config = tyro.cli(PamaConfig)
     helper = ResizeHelper()
 
-    # content_path = "data/content/frame_00001.png"
-    style_path = "data/nnst_style/S1.jpg"
-    # style_path = "data/style/17.jpg"
-
     transform = transforms.Compose([
         transforms.Resize((512, 512)),
-        # transforms.RandomCrop((256, 256)),
-        transforms.RandomEqualize(p=1),
         transforms.ToTensor(), # [0, 1]
         # transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) # [-1, 1]
         transforms.Lambda(lambda x: x.mul_(pama_config.input_range))
@@ -64,35 +57,28 @@ if __name__ == '__main__':
     
     transform2 = transforms.Compose([
         transforms.Resize((512, 512)),
-        # transforms.RandomCrop((256, 256)),
-        # transforms.RandomEqualize(p=1),
         transforms.ToTensor(), # [0, 1]
         # transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) # [-1, 1]
         transforms.Lambda(lambda x: x.mul_(pama_config.input_range))
     ])
     
 
-    Is = transform2(Image.open(style_path).convert("RGB")).unsqueeze(0)
+    import time
+    start = time.time()
     st_images = []
-    for content_path in os.listdir('data/content'):
-        Ic = transform(Image.open(f'data/content/{content_path}').convert("RGB")).unsqueeze(0)
-        # Ic = torch.rand_like(Ic)
-        # Ic = 0.8*Ic + 0.2*torch.rand_like(Ic)
-        name = os.path.basename(content_path)
+    for content_path in track(os.listdir('data/contents')):
+        for style_path in os.listdir('data/styles'):
+            Ic = transform(Image.open(f'data/contents/{content_path}').convert("RGB")).unsqueeze(0)
+            Is = transform2(Image.open(f'data/styles/{style_path}').convert("RGB")).unsqueeze(0)
 
-        padded_image = helper.pad_to8x(Ic)
-        style_transferred_image = pama_infer_one_image(padded_image, Is, pama_config)
-        #! resize to original image size
-        style_transferred_image = helper.crop_to_original(style_transferred_image)
+            padded_image = helper.pad_to8x(Ic)
+            style_transferred_image = pama_infer_one_image(padded_image, Is, pama_config)
+            #! resize to original image size
+            style_transferred_image = helper.crop_to_original(style_transferred_image)
 
-        # ret = tensor2img(style_transferred_image)
-        # showimgs(1, 1, [ret], ['pama'])
-        st_images.append(style_transferred_image*1.5)
-
-        # save_image(style_transferred_image, f'results/lego/{name}_14.jpg')
+            save_image(style_transferred_image, f'results/TestMetrics/pama_time/{get_basename(content_path)}_{get_basename(style_path)}.jpg')
     
-    grid = make_grid(torch.cat(st_images), nrow=4, pad_value=1)
-    save_image(grid, f'grid_{pama_config.input_range}_S1_0.png')
+    print((time.time() - start) / 256)
 
 
 

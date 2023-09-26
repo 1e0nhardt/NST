@@ -1,9 +1,7 @@
 import torch
 
-from utils import LOGGER
 
-
-def gram_matrix(feature_maps):
+def gram_matrix(feature_maps, div=True):
     """
     feature_maps: b, c, h, w
     gram_matrix: b, c, c
@@ -11,7 +9,10 @@ def gram_matrix(feature_maps):
     b, c, h, w = feature_maps.size()
     features = feature_maps.view(b, c, h * w)
     G = torch.bmm(features, torch.transpose(features, 1, 2))
-    G.div_(h*w)
+    if div:
+        G.div_(h*w)
+    else:
+        G.div_(c)
     # logger.info('#'*80)
     # logger.info(f'Gram Matrix Sum {G.sum()}')
     # logger.info(f'Gram Matrix Mean {G.mean()}')
@@ -21,10 +22,10 @@ def gram_matrix(feature_maps):
     return G
 
 
-def gram_loss(content_features, target_features, weights=[1 for n in [64,128,256,512,512]]):
+def gram_loss(content_features, target_features, weights=[1 for n in [64,128,256,512,512]], div=True):
     gram_loss = 0.0
     for i, (c_feats, s_feats) in enumerate(zip(content_features, target_features)):
-        gram_loss += weights[i] * torch.mean((gram_matrix(c_feats) - gram_matrix(s_feats))**2)
+        gram_loss += weights[i] * torch.mean((gram_matrix(c_feats, div=div) - gram_matrix(s_feats, div=div))**2)
     return gram_loss
 
 
@@ -65,7 +66,10 @@ def cos_distance(a, b, center=True):
 
 
 def cos_loss(a, b, center=True):
-    """cosine loss"""
+    """
+    cosine loss
+    计算逐点的cosine distance。
+    """
     a_norm = (a * a).sum(1, keepdims=True).sqrt()
     b_norm = (b * b).sum(1, keepdims=True).sqrt()
     

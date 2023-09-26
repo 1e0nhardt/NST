@@ -1,26 +1,20 @@
 import random
 from dataclasses import dataclass
 
-import numpy as np
 import torch
-import torch.nn as nn
 import tyro
-from einops import rearrange, repeat
-from PIL import Image
 
 from losses import cos_loss
-from nnst.image_pyramid import dec_lap_pyr, syn_lap_pyr
-from nnst.matting_laplacian import compute_laplacian, laplacian_loss_grad
 from pipeline_optimize import OptimzeBaseConfig, OptimzeBasePipeline
-from utils import LOGGER, AorB, ResizeHelper, check_folder
+from image_pyramid import dec_lap_pyr, syn_lap_pyr
+from utils import LOGGER, AorB
 from utils_st import (calc_remd_loss, feat_replace, nnst_fs_loss,
-                      split_downsample)
+                            split_downsample)
 
 
-# 不表明类型就不会覆盖父类的同名属性。
 @dataclass
 class NNSTConfig(OptimzeBaseConfig):
-    """NNST Arguments"""
+    """My reimplement of a simplified version of NNST."""
     
     name: str = 'nnst'
     """expr name. Do not change this."""
@@ -41,23 +35,21 @@ class NNSTConfig(OptimzeBaseConfig):
     lr: float = 2e-3
     max_iter: int = 200
     standardize: bool = True
-    matting_laplacian_regularizer: bool = False
-    mlr_weight: int = 10
     split_downsample: bool = False
     weight_factor: float = 1.0
     use_remd_loss: bool = True
     use_wandb: bool = False
-    entropy_reg_weight: float = 1e10
+    exact_resize: bool = True
 
 
 class NNSTPipeline(OptimzeBasePipeline):
     def __init__(self, config: NNSTConfig) -> None:
         super().__init__(config)
         self.config = config
-        check_folder(self.config.output_dir)
 
     def add_extra_file_infos(self):
-        return [str(self.config.alpha)] + [str(self.config.weight_factor)] + AorB(self.config.split_downsample, 'split', 'stride') + AorB(self.config.matting_laplacian_regularizer, f'mlr-{self.config.mlr_weight}')
+        return []
+        # [str(self.config.alpha)] + [str(self.config.weight_factor)] + AorB(self.config.split_downsample, 'split', 'stride') + AorB(self.config.matting_laplacian_regularizer, f'mlr-{self.config.mlr_weight}')
     
     def add_extra_infos(self):
         return AorB(self.config.use_remd_loss, 'remd')
@@ -88,16 +80,6 @@ class NNSTPipeline(OptimzeBasePipeline):
             output_image_tmp = syn_lap_pyr(output_pyramid[scale:])
             LOGGER.info(f'Stage {self.config.max_scales - scale}: {output_image_tmp.shape}')
 
-            # 计算内容图的Matting Laplacian矩阵，并保存为稀疏张量
-            if self.config.matting_laplacian_regularizer: 
-                M = compute_laplacian(self.transform_post(content_image_tmp.squeeze()))
-                indices = torch.from_numpy(np.vstack((M.row, M.col))).long().to(self.device)
-                values = torch.from_numpy(M.data).to(self.device)
-                shape = torch.Size(M.shape)
-                matting_laplacian = torch.sparse_coo_tensor(indices, values, shape, device=self.device)
-            else:
-                matting_laplacian = None
-
             #! 获取目标特征
             with torch.no_grad():
                 # alpha用于控制风格化程度
@@ -108,7 +90,7 @@ class NNSTPipeline(OptimzeBasePipeline):
 
                 # 用内容的高频特征作为寻找特征的起点
                 output_init = syn_lap_pyr([content_pyramid[scale]] + output_pyramid[(scale + 1):])
-                # 提取参考图片特征 | 可以使用旋转增强flip_aug
+                # 提取参考图片特征 | 可以使用旋转增强flip_aug，但没必要
                 _, style_hypercolumns = self.model(style_image_tmp, hypercolumn=True, weight_factor=self.config.weight_factor, normalize=True)
                 # 将内容图和低分辨率下优化过的结果混合
                 fuse_content = (1 - alpha) * content_image_tmp + alpha * output_init
@@ -127,7 +109,7 @@ class NNSTPipeline(OptimzeBasePipeline):
                     self.writer.log_image(f'HM_init', self.tensor2pil(output_image_tensor))
 
             #! 在当前分辨率下用Hypercolumn Matching优化输出图像
-            self.optimize_output(output_pyramid, target_feats, scale, matting_laplacian=matting_laplacian)
+            self.optimize_output(output_pyramid, target_feats, scale)
 
             with torch.no_grad(): # 保存中间优化结果
                 if scale == 0:
@@ -137,16 +119,16 @@ class NNSTPipeline(OptimzeBasePipeline):
 
         #! 在最高分辨率下用Feature Split优化输出图像
         LOGGER.info(f'Final Stage: FS')
-        self.optimize_output(output_pyramid, None, scale, Is, final_pass=True, matting_laplacian=matting_laplacian)
+        self.optimize_output(output_pyramid, None, scale, Is, final_pass=True)
 
         with torch.no_grad(): # 保存最终输出
             output_image_tensor = syn_lap_pyr(output_pyramid)
             self.save_image(output_image_tensor, 'result')
             self.writer.log_image('result', self.tensor2pil(output_image_tensor))
     
-    def optimize_output(self, output_pyramid, target_feats, scale, style_image=None, final_pass=False, matting_laplacian=None):
+    def optimize_output(self, output_pyramid, target_feats, scale, style_image=None, final_pass=False):
         # 将当前尺度下的图像金字塔设为优化对象
-        opt_vars = [nn.Parameter(level_image) for level_image in output_pyramid[scale:]]
+        opt_vars = [torch.nn.Parameter(level_image) for level_image in output_pyramid[scale:]]
         optimizer = torch.optim.Adam(opt_vars, lr=self.config.lr)
 
         if final_pass: # FS需要重新提取各个尺度的特征
@@ -160,15 +142,6 @@ class NNSTPipeline(OptimzeBasePipeline):
             output_image = syn_lap_pyr(opt_vars)
 
             loss = 0
-
-            #! 使用 Matting Laplacian 正则项
-            if self.config.matting_laplacian_regularizer:
-                l, grad = laplacian_loss_grad(output_image.squeeze(), matting_laplacian)
-                grad = grad * self.config.mlr_weight
-                grad = grad.clamp(-0.05, 0.05)
-                self.writer.log_scaler(f'grad', grad.mean())
-                output_image.backward(grad.unsqueeze(0), retain_graph=True)
-                loss += l.mean()
 
             if not final_pass:
                 # HM
@@ -220,30 +193,31 @@ class NNSTPipeline(OptimzeBasePipeline):
         output_pyramid[scale:] = dec_lap_pyr(output_image, self.config.pyramid_levels - scale)
 
 if __name__ == '__main__':
-    # x = torch.rand((6, 3, 8, 8))
-    # r = torch.split(x, 1)
-    # print(len(r))
-    # print(r[0].shape)
-    # exit()
     import os
     args = tyro.cli(NNSTConfig)
     pipeline = NNSTPipeline(args)
-    content_dir='data/content/'
-    style_dir='data/nnst_style/'
-    # for c in os.listdir(content_dir):
-    #     for s in os.listdir(style_dir):
-    #         pipeline(
-    #             content_dir + c,
-    #             style_dir + s
-    #         )
+    content_dir='data/contents/'
+    style_dir='data/styles/'
+    for c in os.listdir(content_dir):
+        for s in os.listdir(style_dir):
+            pipeline(
+                content_dir + c,
+                style_dir + s
+            )
     # exit()
-    pipeline(
-        # 'data/truck/14.png', 
-        'data/content/sailboat.jpg', 
-        # 'data/content/C2.png', 
-        # 'data/style/122.jpg',
-        'data/nnst_style/S1.jpg'
-    )
+    # for s in os.listdir(style_dir):
+    #     pipeline(
+    #         'data/content/sailboat.jpg', 
+    #         style_dir + s
+    #     )
+        
+    # pipeline(
+    #     # 'data/truck/14.png', 
+    #     'data/content/sailboat.jpg', 
+    #     # 'data/content/C2.png', 
+    #     # 'data/style/122.jpg',
+    #     'data/nnst_style/S1.jpg'
+    # )
 
     # pipeline(
     #     'data/content/content_im.jpg', 

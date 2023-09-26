@@ -1,24 +1,31 @@
+import random
 import time
 import typing
+import warnings
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from functools import wraps
+
 import cv2
 import numpy as np
-from PIL import Image
-
 import torch
+import wandb
 from einops import rearrange, repeat
+from matplotlib import pyplot as plt
+from PIL import Image
+from piq import LPIPS, ssim
 from rich.traceback import install
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
 
-import wandb
 from models.inception import InceptionFeatureExtractor
 from models.vgg import VGG16FeatureExtractor, VGG19FeatureExtractor
-from utils import (LOGGER, AorB, ResizeHelper, ResizeMaxSide, TimeRecorder, check_folder,
-                   get_basename, images2gif, str2list)
+from utils import (LOGGER, AorB, ResizeHelper, ResizeMaxSide,
+                         TimeRecorder, check_folder, get_basename, images2gif,
+                         str2list)
+from utils_st import calc_mean_std, covariance_loss, split_downsample
 
+warnings.filterwarnings('ignore')
 install(show_locals=False) # 设置rich为默认的异常输出处理程序
 
 
@@ -30,7 +37,7 @@ class OptimzeBaseConfig:
 
     name: str = 'base'
     """expr name. Change this to your pipeline name."""
-    output_dir: str = "./results"
+    output_dir: str = "./results/TTTT"
     """output dir"""
     max_iter: int = 500
     """optimize steps"""
@@ -40,12 +47,20 @@ class OptimzeBaseConfig:
     """save init image"""
     save_process_gif: bool = False
     """save images of optimize process as gif"""
+    save_rgbhist: bool = False
+    """save rgb histogram of final result"""
     verbose: bool = False
     """show additional information"""
     use_wandb: bool = False
     """use wandb"""
     use_tensorboard: bool = False
     """use tensorboard"""
+    show_metrics: bool = True
+    """calculate and show ssim and lpips metrics"""
+    content_path: str = 'data/contents/5.jpg'
+    """content image path"""
+    style_path: str = 'data/styles/12.jpg'
+    """style image path"""
 
     model_type: str = 'vgg16'
     """feature extractor model type vgg16 | vgg19 | inception. Generally, vgg16 is enough."""
@@ -69,6 +84,11 @@ class OptimzeBaseConfig:
     """exact size of inputs"""
     use_tv_reg: bool = False
     """use total variance regularizer"""
+    max_scales: int = 4
+    """do ST on how many image pyramid levels"""
+    pyramid_levels: int = 8
+    """levels of image pyramid"""
+    is_demo: bool = False
 
 
 class OptimzeBasePipeline(object):
@@ -82,6 +102,8 @@ class OptimzeBasePipeline(object):
         
         # prepare transforms
         self.transform_pre, self.transform_post = self.prepare_transforms()
+
+        self.lpips = LPIPS()
 
         # loggers
         self.time_record = TimeRecorder(self.config.output_dir.split('/')[-1])
@@ -124,7 +146,7 @@ class OptimzeBasePipeline(object):
         infos = []
         infos += [self.config.optimize_strategy]
         # infos += [self.config.model_type]
-        # infos += [self.config.layers.replace(' ', '').replace(',', '-')]
+        infos += [self.config.layers.replace(' ', '').replace(',', '-')]
         # infos += [self.config.optimizer]
         # infos += AorB(self.config.standardize, 'std', 'raw')
         # infos += ['R' + str(self.config.input_range)]
@@ -168,9 +190,34 @@ class OptimzeBasePipeline(object):
     def inspect_features(self, feats: torch.Tensor, tag: str):
         LOGGER.debug('%s: mean=%.3e, var=%.3e, max=%.3e, min=%.3e', tag, feats.detach().mean().item(), feats.detach().var().item(), feats.detach().max().item(), feats.detach().min().item())
     
-    def visualize_features(self, feats: torch.Tensor, tag: str):
-        for i, f in enumerate(feats, 1):
-            self.writer.add_images(tag, repeat(rearrange(f, 'n c h w -> c n h w'), 'n c h w -> n (m c) h w', m=3), global_step=i, dataformats='NCHW')
+    def visualize_features(self, feats: typing.List[torch.Tensor], tag: str, normalize=True):
+        """
+        visualize every channel of feature maps with color map "turbo".
+
+        :param feats: List of feature maps [(1,c1,h1,w1), (1,c2,h2,w2), ... ]
+        :param tag: image tag name
+        """
+        for i, fm in enumerate(feats, 1):
+            false_color_images = []
+            f = fm.detach()
+            for ch in f[0]: # ch:[h, w]
+                if normalize:
+                    # ch = (ch - ch.min())/(ch.max() - ch.min()) # 直接归一化
+
+                    # 以均值为界分别归一化
+                    ch = ch - ch.mean()
+                    ch[ch < 0] = ch[ch < 0] / abs(ch.min())
+                    ch[ch > 0] = ch[ch > 0] / ch.max()
+                    ch = (ch + 1)/2
+                # applyColorMap转换灰度图需要输入类型为CV_8UC1
+                cvin = (ch*255).cpu().numpy().astype(np.uint8) 
+                # numpy支持[::-1]，但tensor不支持。并且，使用[::-1]后，并没有真的生成新的numpy数组，而只是，将numpy数组底层的stride记为-1了。这样传给torch.tensor就会报错。==> At least one stride in the given numpy array is negative, and tensors with negative strides are not currently supported. (You can probably work around this by making a copy of your array  with array.copy().)
+                cvnp = cv2.applyColorMap(cvin, cv2.COLORMAP_TWILIGHT_SHIFTED)[..., ::-1].copy()  # bgr->rgb
+                false_color_images.append(torch.tensor(cvnp).permute(2, 0, 1)) # (h,w,3)->(3,h,w)
+            f = torch.stack(false_color_images) # (c,3,h,w)
+                
+            self.writer.add_images(tag, f, global_step=i, dataformats='NCHW')
+            # self.writer.add_images(tag, repeat(rearrange(fm, 'n c h w -> c n h w'), 'n c h w -> n (m c) h w', m=3), global_step=i, dataformats='NCHW')
     
     def get_lap_filtered_image(self, path):
         # 读取图像
@@ -185,6 +232,18 @@ class OptimzeBasePipeline(object):
             content_laplacian = ResizeMaxSide(self.config.max_side)(transforms.ToTensor()(laplacian_abs))
         content_laplacian = repeat(content_laplacian, 'c h w -> (n c) h w', n=3).unsqueeze(0)
         return content_laplacian.to(self.device)
+    
+    def downsample_features_if_needed(self, feats, split=False, max_size=64):
+        # 如果特征图宽高太大，则进行稀疏采样
+        if max(feats.size(2), feats.size(3)) > max_size:
+            stride = max(feats.size(2), feats.size(3)) // max_size
+            if split:
+                feats_lst = split_downsample(feats, stride)
+                feats = torch.cat(feats_lst, dim=1)
+            else:
+                offset = random.randint(0, stride - 1)
+                feats = feats[:, :, offset::stride, offset::stride]
+        return feats
     ############################ Tools End ####################################
        
     def common_optimize_process(self, Ic, Is):
@@ -208,35 +267,109 @@ class OptimzeBasePipeline(object):
         self.time_record.reset_time()
         
         #! read inputs and preprocess
-        # prepare input tensors: (1, c, h, w), (1, c, h, w)
-        content_image = self.transform_pre(Image.open(content_path)).unsqueeze(0).to(self.device)
+        # prepare input tensors: (1, 3, h, w), (1, 3, h, w)
         # convert("RGB") make gray image also 3 channels
-        style_image = self.transform_pre(Image.open(style_path).convert("RGB")).unsqueeze(0).to(self.device)
+        Ic = self.transform_pre(Image.open(content_path).convert("RGB")).unsqueeze(0).to(self.device)
+        Is = self.transform_pre(Image.open(style_path).convert("RGB")).unsqueeze(0).to(self.device)
         self.content_path = content_path #* 当前拉普拉斯预处理要用。以后应该删除。
+        # Is2 = self.transform_pre(Image.open('data/nnst_style/S4.jpg').convert("RGB")).unsqueeze(0).to(self.device)
 
         resize_helper = ResizeHelper()
-        content_image = resize_helper.resize_to8x(content_image)
-        style_image = resize_helper.resize_to8x(style_image)
+        Ic = resize_helper.resize_to8x(Ic)
+        Is = resize_helper.resize_to8x(Is)
+        # self.Is2 = resize_helper.resize_to8x(Is2)
 
         #! Core of Algorithm
         if self.config.optimize_strategy == 'common':
-            self.common_optimize_process(content_image, style_image)
+            self.common_optimize_process(Ic, Is)
         elif self.config.optimize_strategy == 'pyramid':
-            self.pyramid_optimize_process(content_image, style_image)
-        elif self.config.optimize_strategy == 'cascade':
-            self.cascade_optimize_process(content_image, style_image)
+            self.pyramid_optimize_process(Ic, Is)
         else:
             raise NotImplementedError('TODO')
+        
+        if self.config.is_demo:
+            return self.optimize_images['result']
 
         #! show and save results
         self.time_record.set_record_point('Optimization')
+
+        #! calc metrics
+        ssim_metric = ssim(Ic.to(self.device), self.transform_pre(self.optimize_images['result']).to(self.device).unsqueeze(0))
+        lpips_metric = self.lpips(Is.to(self.device), self.transform_pre(self.optimize_images['result']).to(self.device).unsqueeze(0))
+        # lpips_metric = torch.tensor(-1)
+        self.time_record.set_record('SSIM', f'{ssim_metric.item():.4f}')
+        self.time_record.set_record('LPIPS', f'{lpips_metric.item():.4f}')
+
+        Ics = self.transform_pre(self.optimize_images['result']).to(self.device).unsqueeze(0)
+
+        mean_loss, std_loss, cov_loss, mean_loss_before, std_loss_before, cov_loss_before = 0, 0, 0, 0, 0, 0
+
+        with torch.no_grad():
+            Ics_41, Ics_featrues = self.model(Ics)
+            Is_41, Is_featrues = self.model(Is)
+            Ic_41, Ic_featrues = self.model(Ic)
+            mean_diffs = []
+            for cs, s, c in zip(Ics_featrues, Is_featrues, Ic_featrues):
+                cs_mean, cs_std = calc_mean_std(cs)
+                s_mean, s_std = calc_mean_std(s)
+                c_mean, c_std = calc_mean_std(c)
+                mean_loss_before += torch.mean((c_mean - s_mean)**2)
+                std_loss_before += torch.mean((c_std - s_std)**2)
+                cov_loss_before += covariance_loss(c, s)
+                mean_loss += torch.mean((cs_mean - s_mean)**2)
+                std_loss += torch.mean((cs_std - s_std)**2)
+                cov_loss += covariance_loss(cs, s)
+                mean_diff_ccs = (abs(c_mean - cs_mean)).squeeze().cpu()
+                mean_diff_cs = (abs(c_mean - s_mean)).squeeze().cpu()
+                mean_diffs.append((mean_diff_ccs, mean_diff_cs))
+
+            # content_loss_before = torch.mean((Ic_41 - Is_41)**2)
+            # content_loss = torch.mean((Ics_41 - Ic_41)**2)
+            
+        self.time_record.set_record('Mean Loss', f'{mean_loss:.3e}')
+        self.time_record.set_record('L_m Before', f'{mean_loss_before:.3e}')
+        self.time_record.set_record('Std Loss', f'{std_loss:.3e}')
+        self.time_record.set_record('L_std Before', f'{std_loss_before:.3e}')
+        self.time_record.set_record('Cov Loss', f'{cov_loss:.4f}')
+        self.time_record.set_record('L_cov Before', f'{cov_loss_before:.4f}')
+        # self.time_record.set_record('Content Loss', f'{content_loss:.4f}')
+        # self.time_record.set_record('L_c Before', f'{content_loss_before:.4f}')
         self.time_record.show()
+        self.time_record.save(expr_dir, filename)
+
+        # torch.save(mean_diffs, expr_dir + f'/{filename}_data.pt')
         
         if self.config.save_process_gif:
             images2gif(list(self.optimize_images.values()), expr_dir + f'/{filename}_process.gif')
 
         for k, img in self.optimize_images.items():
-            img.save(expr_dir + f'/{filename}_{k}.png')
+            img.save(expr_dir + f"/{filename}_{k}.png")
+
+        if self.optimize_images.get('result', None) is not None and self.config.save_rgbhist:
+            Io = self.optimize_images['result']
+            Io_numpy = np.array(Io)
+            fig, ax = plt.subplots()
+            bgrColor = ('blue', 'green', 'red')
+             # 统计窗口间隔 , 设置小了锯齿状较为明显 最小为1 最好可以被256整除
+            bin_win  = 2
+            # 设定统计窗口bins的总数
+            bin_num = int(256/bin_win)
+            # 控制画布的窗口x坐标的稀疏程度. 最密集就设定xticks_win=1
+            xticks_win = 8
+
+            for cidx, color in enumerate(bgrColor):
+                counts, bins = np.histogram(Io_numpy[:, :, cidx].reshape(-1), bins=bin_num, range=(0, 256))
+                ax.plot(counts, color=color)
+
+            # 设定画布的范围
+            ax.set_xlim([0, bin_num])
+            # 设定x轴方向标注的位置
+            ax.set_xticks(np.arange(0, bin_num+1, xticks_win))
+            # 设定x轴方向标注的内容
+            ax.set_xticklabels(list(range(0, 257, bin_win*xticks_win)),rotation=45)
+
+            # 保存
+            plt.savefig(expr_dir + f'/{filename}_{k}_rgbhist.png')
 
         # change config of wandb to save important infomation
         self.writer.update_cfg(Timecost=self.time_record.get_record_point('Optimization'))
