@@ -26,6 +26,8 @@ python demo.py
 python pipeline_main.py --content_path xx --style_path xx
 ```
 
+Our result data is also available at [here](https://pan.baidu.com/s/1EbYS7WHnTcUtFaCLPIGYZw?pwd=zxfa)
+
 ## Acknowledgement
 - [PAMA](https://github.com/luoxuan-cs/PAMA)
 - [STROTSS](https://github.com/nkolkin13/STROTSS)
